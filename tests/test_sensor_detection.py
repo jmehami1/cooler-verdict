@@ -6,7 +6,7 @@ import csv
 from types import SimpleNamespace
 import pytest
 from unittest.mock import patch
-import temp_compare
+import cooler_verdict as temp_compare
 
 
 def _generate_noisy_steady_series(seed: int, steps: int = 100):
