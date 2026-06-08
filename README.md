@@ -1,12 +1,14 @@
-# CPU/GPU Cooling Comparison Runner
+# CoolVerdict
 
-Runs a four-phase cooling comparison test: idle and stress, before and after the external cooler is attached. It logs temperature sensors, CPU frequency, and GPU telemetry, and it can check for background processes before starting.
+I really hate overheating laptops, but I also hate external cooling solutions that don't work. This project is a simple tool to help me (and hopefully others) determine if an external cooler is actually effective at reducing temperatures under load. 
 
-Tested on Ubuntu 24.04.
+It compares idle and stress temperatures before and after attaching the cooler, and it gives a clear verdict on whether the cooler is worth keeping or should be returned.
 
 ![Cooling Compare GUI](docs/GUI.png)
 
 ## What It Does
+
+Runs a four-phase cooling comparison test: idle and stress, before and after the external cooler is attached. It logs temperature sensors, CPU frequency, and GPU telemetry, and it can check for background processes before starting.
 
 - CLI runner: `python temp_compare.py`
 - GUI runner: `python temp_compare_gui.py`
@@ -14,6 +16,8 @@ Tested on Ubuntu 24.04.
 - Optional clean-start enforcement for interference checks
 
 ## Setup
+
+Tested on Ubuntu 24.04. 
 
 ```bash
 python3 -m venv .venv
