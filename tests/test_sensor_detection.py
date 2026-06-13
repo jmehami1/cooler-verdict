@@ -148,9 +148,19 @@ def test_summarize_cooler_effect_from_csv_recommends_keep(tmp_path):
 
     out = temp_compare.summarize_cooler_effect_from_csv(csv_path)
     assert out["keep_recommended"]
+    assert out["verdict"] in ("keep", "definitely_keep")
     assert out["best_temp_drop_c"] >= 5.0
     assert out["best_cpu_freq_gain_pct"] >= 3.0
-    assert out["noise_considered"] is False
+    criteria_by_name = {item["name"]: item for item in out["criteria_evaluation"]}
+    assert criteria_by_name["data_complete"]["status"] == "pass"
+    assert criteria_by_name["comparable_cpu_or_gpu_sensors_available"]["status"] == "pass"
+    assert criteria_by_name["minimum_samples_met"]["status"] == "pass"
+    assert criteria_by_name["idle_temperature_improved"]["status"] == "pass"
+    assert criteria_by_name["keep_requirements_met"]["status"] == "pass"
+    sensor_map = {item["sensor"]: item for item in out["sensor_temp_drop_summary"]}
+    assert "cpu:pkg:temp_c" in sensor_map
+    assert sensor_map["cpu:pkg:temp_c"]["idle_drop_pct"] is not None
+    assert sensor_map["cpu:pkg:temp_c"]["stress_drop_pct"] is not None
 
 
 def test_summarize_cooler_effect_from_csv_flags_temp_clock_tradeoff(tmp_path):
@@ -167,3 +177,18 @@ def test_summarize_cooler_effect_from_csv_flags_temp_clock_tradeoff(tmp_path):
     out = temp_compare.summarize_cooler_effect_from_csv(csv_path)
     assert out["clock_tradeoff_note"] is not None
     assert out["best_cpu_freq_gain_pct"] >= 3.0
+    criteria_by_name = {item["name"]: item for item in out["criteria_evaluation"]}
+    assert criteria_by_name["stress_performance_positive_tradeoff"]["status"] in ("pass", "warning", "fail")
+    assert len(out["sensor_temp_drop_summary"]) > 0
+
+
+def test_wait_until_temperatures_steady_honors_cancel_callback():
+    out = temp_compare.wait_until_temperatures_steady(
+        interval_sec=1.0,
+        timeout_sec=60,
+        cancel_cb=lambda: True,
+    )
+
+    assert out["cancelled"] is True
+    assert out["timed_out"] is False
+    assert out["reached_steady"] is False

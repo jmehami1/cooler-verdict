@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import html
 import json
 import math
 import os
@@ -261,6 +262,8 @@ def wait_until_temperatures_steady(
     window_points: int = 12,
     min_points: int = 12,
     status_cb: Optional[Callable[[str], None]] = None,
+    progress_cb: Optional[Callable[[int, int, int], None]] = None,
+    cancel_cb: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Poll temperatures until all detected temperature sensors are approximately steady."""
     if interval_sec <= 0:
@@ -281,11 +284,30 @@ def wait_until_temperatures_steady(
     while True:
         now = time.time()
         elapsed = now - started
+        elapsed_i = max(0, int(elapsed))
+        remaining_i = max(0, int(math.ceil(timeout_sec - elapsed)))
+        if progress_cb:
+            progress_cb(elapsed_i, remaining_i, timeout_sec)
+        if cancel_cb and cancel_cb():
+            emit("Steady-state check cancelled.")
+            if progress_cb:
+                progress_cb(elapsed_i, 0, timeout_sec)
+            return {
+                "reached_steady": False,
+                "timed_out": False,
+                "cancelled": True,
+                "wait_duration_sec": int(elapsed),
+                "samples": samples,
+                "temp_sensors_tracked": len([k for k in history if k.endswith(":temp_c")]),
+            }
         if elapsed >= timeout_sec:
             emit("Steady-state timeout reached; continuing to next phase.")
+            if progress_cb:
+                progress_cb(max(0, int(timeout_sec)), 0, timeout_sec)
             return {
                 "reached_steady": False,
                 "timed_out": True,
+                "cancelled": False,
                 "wait_duration_sec": int(elapsed),
                 "samples": samples,
                 "temp_sensors_tracked": len([k for k in history if k.endswith(":temp_c")]),
@@ -317,9 +339,12 @@ def wait_until_temperatures_steady(
             min_points=min_points,
         ):
             emit("All temperatures are at approximate steady state.")
+            if progress_cb:
+                progress_cb(elapsed_i, 0, timeout_sec)
             return {
                 "reached_steady": True,
                 "timed_out": False,
+                "cancelled": False,
                 "wait_duration_sec": int(elapsed),
                 "samples": samples,
                 "temp_sensors_tracked": temp_sensor_count,
@@ -371,14 +396,17 @@ def _is_gpu_temp_sensor(sensor: str) -> bool:
 def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
     """Summarize cooler effectiveness from phase CSV data.
 
-    Uses final-window averages per phase and ignores external noise because
-    this runner does not measure acoustic data.
+    Uses final-window averages per phase and various heuristics to determine if the cooler provides a meaningful improvement.
     """
+    phase_names = ["uncooled_idle", "cooled_idle", "uncooled_stress", "cooled_stress"]
     phase_metrics: Dict[str, Dict[str, List[float]]] = {
-        "uncooled_idle": {"cpu_temp": [], "gpu_temp": [], "cpu_freq": []},
-        "cooled_idle": {"cpu_temp": [], "gpu_temp": [], "cpu_freq": []},
-        "uncooled_stress": {"cpu_temp": [], "gpu_temp": [], "cpu_freq": []},
-        "cooled_stress": {"cpu_temp": [], "gpu_temp": [], "cpu_freq": []},
+        phase: {"cpu_temp": [], "gpu_temp": [], "storage_temp": [], "cpu_freq": []}
+        for phase in phase_names
+    }
+    phase_sensor_temps: Dict[str, Dict[str, List[float]]] = {phase: {} for phase in phase_names}
+    phase_sample_timestamps: Dict[str, set[str]] = {phase: set() for phase in phase_names}
+    phase_component_sensors: Dict[str, Dict[str, set[str]]] = {
+        phase: {"cpu": set(), "gpu": set(), "storage": set()} for phase in phase_names
     }
 
     if not csv_path.exists():
@@ -386,8 +414,17 @@ def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
             "verdict": "inconclusive",
             "keep_recommended": False,
             "summary_short": "Inconclusive: no CSV data.",
-            "noise_considered": False,
         }
+
+    def sensor_component(sensor: str) -> Optional[str]:
+        if _is_cpu_temp_sensor(sensor):
+            return "cpu"
+        if _is_gpu_temp_sensor(sensor):
+            return "gpu"
+        lowered = sensor.lower()
+        if sensor.endswith(":temp_c") and any(token in lowered for token in ("nvme", "ssd", "storage", "disk", "hdd", "sata")):
+            return "storage"
+        return None
 
     with csv_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
@@ -395,6 +432,7 @@ def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
             phase = (row.get("phase") or "").strip()
             sensor = (row.get("sensor") or "").strip()
             value_raw = (row.get("value") or "").strip()
+            ts = (row.get("timestamp_utc") or "").strip()
             if phase not in phase_metrics:
                 continue
             try:
@@ -402,20 +440,39 @@ def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
             except ValueError:
                 continue
 
+            if ts:
+                phase_sample_timestamps[phase].add(ts)
+
             if sensor == "cpu_freq:avg:mhz":
                 phase_metrics[phase]["cpu_freq"].append(value)
-            if _is_cpu_temp_sensor(sensor):
+            component = sensor_component(sensor)
+            if component == "cpu":
                 phase_metrics[phase]["cpu_temp"].append(value)
-            if _is_gpu_temp_sensor(sensor):
+            elif component == "gpu":
                 phase_metrics[phase]["gpu_temp"].append(value)
+            elif component == "storage":
+                phase_metrics[phase]["storage_temp"].append(value)
+            if sensor.endswith(":temp_c"):
+                phase_sensor_temps[phase].setdefault(sensor, []).append(value)
+                if component:
+                    phase_component_sensors[phase][component].add(sensor)
 
     phase_stats: Dict[str, Dict[str, Optional[float]]] = {}
     for phase, metrics in phase_metrics.items():
         phase_stats[phase] = {
             "cpu_temp_avg": _mean(_tail_window(metrics["cpu_temp"])),
             "gpu_temp_avg": _mean(_tail_window(metrics["gpu_temp"])),
+            "storage_temp_avg": _mean(_tail_window(metrics["storage_temp"])),
             "cpu_freq_avg_mhz": _mean(_tail_window(metrics["cpu_freq"])),
         }
+
+    phase_sensor_temp_avg: Dict[str, Dict[str, Optional[float]]] = {
+        phase: {
+            sensor: _mean(_tail_window(values))
+            for sensor, values in sensor_map.items()
+        }
+        for phase, sensor_map in phase_sensor_temps.items()
+    }
 
     def pct_gain(new_val: Optional[float], old_val: Optional[float]) -> Optional[float]:
         if new_val is None or old_val is None or old_val == 0:
@@ -437,6 +494,10 @@ def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
                 phase_stats["uncooled_idle"]["gpu_temp_avg"],
                 phase_stats["cooled_idle"]["gpu_temp_avg"],
             ),
+            "storage_temp_drop_c": temp_drop(
+                phase_stats["uncooled_idle"]["storage_temp_avg"],
+                phase_stats["cooled_idle"]["storage_temp_avg"],
+            ),
             "cpu_freq_gain_pct": pct_gain(
                 phase_stats["cooled_idle"]["cpu_freq_avg_mhz"],
                 phase_stats["uncooled_idle"]["cpu_freq_avg_mhz"],
@@ -451,12 +512,59 @@ def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
                 phase_stats["uncooled_stress"]["gpu_temp_avg"],
                 phase_stats["cooled_stress"]["gpu_temp_avg"],
             ),
+            "storage_temp_drop_c": temp_drop(
+                phase_stats["uncooled_stress"]["storage_temp_avg"],
+                phase_stats["cooled_stress"]["storage_temp_avg"],
+            ),
             "cpu_freq_gain_pct": pct_gain(
                 phase_stats["cooled_stress"]["cpu_freq_avg_mhz"],
                 phase_stats["uncooled_stress"]["cpu_freq_avg_mhz"],
             ),
         },
     }
+
+    sensor_temp_drop_summary: List[Dict[str, object]] = []
+    all_sensors = sorted(
+        set(phase_sensor_temp_avg["uncooled_idle"]) | set(phase_sensor_temp_avg["uncooled_stress"])
+    )
+    for sensor in all_sensors:
+        uncooled_idle = phase_sensor_temp_avg["uncooled_idle"].get(sensor)
+        cooled_idle = phase_sensor_temp_avg["cooled_idle"].get(sensor)
+        uncooled_stress = phase_sensor_temp_avg["uncooled_stress"].get(sensor)
+        cooled_stress = phase_sensor_temp_avg["cooled_stress"].get(sensor)
+
+        idle_drop_c = None
+        idle_drop_pct = None
+        if (
+            uncooled_idle is not None
+            and cooled_idle is not None
+            and uncooled_idle > 0
+        ):
+            idle_drop_c = uncooled_idle - cooled_idle
+            idle_drop_pct = (idle_drop_c / uncooled_idle) * 100.0
+
+        stress_drop_c = None
+        stress_drop_pct = None
+        if (
+            uncooled_stress is not None
+            and cooled_stress is not None
+            and uncooled_stress > 0
+        ):
+            stress_drop_c = uncooled_stress - cooled_stress
+            stress_drop_pct = (stress_drop_c / uncooled_stress) * 100.0
+
+        if idle_drop_pct is None and stress_drop_pct is None:
+            continue
+
+        sensor_temp_drop_summary.append(
+            {
+                "sensor": sensor,
+                "idle_drop_c": round(idle_drop_c, 3) if idle_drop_c is not None else None,
+                "idle_drop_pct": round(idle_drop_pct, 3) if idle_drop_pct is not None else None,
+                "stress_drop_c": round(stress_drop_c, 3) if stress_drop_c is not None else None,
+                "stress_drop_pct": round(stress_drop_pct, 3) if stress_drop_pct is not None else None,
+            }
+        )
 
     all_temp_drops = [
         v
@@ -475,54 +583,345 @@ def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
     worst_temp_drop = min(all_temp_drops) if all_temp_drops else 0.0
     best_freq_gain = max(all_freq_gains) if all_freq_gains else 0.0
 
-    performance_positive_tradeoff = False
-    for profile in comparisons.values():
-        profile_best_drop = max(
-            [x for x in (profile["cpu_temp_drop_c"], profile["gpu_temp_drop_c"]) if x is not None],
-            default=None,
-        )
-        freq_gain = profile["cpu_freq_gain_pct"]
-        if profile_best_drop is None or freq_gain is None:
-            continue
-        # Same/slightly hotter (within 3C) with stronger clocks is considered acceptable.
-        if profile_best_drop <= 0.0 and profile_best_drop >= -3.0 and freq_gain >= 5.0:
-            performance_positive_tradeoff = True
+    idle_cpu_drop = comparisons["idle"]["cpu_temp_drop_c"]
+    idle_gpu_drop = comparisons["idle"]["gpu_temp_drop_c"]
+    stress_cpu_drop = comparisons["stress"]["cpu_temp_drop_c"]
+    stress_gpu_drop = comparisons["stress"]["gpu_temp_drop_c"]
+    stress_freq_gain_raw = comparisons["stress"]["cpu_freq_gain_pct"]
+    stress_freq_gain = float(stress_freq_gain_raw) if stress_freq_gain_raw is not None else 0.0
+    has_stress_clock_data = stress_freq_gain_raw is not None
 
-    if worst_temp_drop < -3.0 and best_freq_gain < 3.0:
-        verdict = "reject"
-        keep = False
-        reason = "hotter without meaningful clock gain"
-    elif best_temp_drop >= 8.0 and best_freq_gain >= 5.0:
-        verdict = "definitely_keep"
-        keep = True
-        reason = "large thermal drop and higher clocks"
-    elif best_temp_drop >= 5.0 and best_freq_gain >= 3.0:
-        verdict = "keep"
-        keep = True
-        reason = "good thermal drop with clock uplift"
-    elif performance_positive_tradeoff:
-        verdict = "keep"
-        keep = True
-        reason = "performance-positive thermal tradeoff"
-    elif best_temp_drop >= 5.0 or best_freq_gain >= 5.0:
-        verdict = "keep"
-        keep = True
-        reason = "meets practical keep threshold"
-    elif best_temp_drop < 3.0 and best_freq_gain < 3.0:
-        verdict = "probably_return"
-        keep = False
-        reason = "marginal improvement"
+    def max_or_none(values: List[Optional[float]]) -> Optional[float]:
+        valid = [float(v) for v in values if v is not None]
+        return max(valid) if valid else None
+
+    def min_or_none(values: List[Optional[float]]) -> Optional[float]:
+        valid = [float(v) for v in values if v is not None]
+        return min(valid) if valid else None
+
+    idle_best_cpu_gpu_drop = max_or_none([idle_cpu_drop, idle_gpu_drop])
+    idle_worst_cpu_gpu_drop = min_or_none([idle_cpu_drop, idle_gpu_drop])
+    stress_best_cpu_gpu_drop = max_or_none([stress_cpu_drop, stress_gpu_drop])
+    stress_worst_cpu_gpu_drop = min_or_none([stress_cpu_drop, stress_gpu_drop])
+
+    phase_complete = {phase: len(phase_sample_timestamps[phase]) > 0 for phase in phase_names}
+    all_phases_complete = all(phase_complete.values())
+
+    uncooled_cpu_gpu = set().union(
+        *(phase_component_sensors[p]["cpu"] | phase_component_sensors[p]["gpu"] for p in ("uncooled_idle", "uncooled_stress"))
+    )
+    cooled_cpu_gpu = set().union(
+        *(phase_component_sensors[p]["cpu"] | phase_component_sensors[p]["gpu"] for p in ("cooled_idle", "cooled_stress"))
+    )
+    comparable_cpu_gpu_sensors = sorted(uncooled_cpu_gpu.intersection(cooled_cpu_gpu))
+    has_comparable_cpu_gpu = len(comparable_cpu_gpu_sensors) > 0
+
+    sample_counts = {phase: len(phase_sample_timestamps[phase]) for phase in phase_names}
+    min_samples = min(sample_counts.values()) if sample_counts else 0
+
+    criteria_evaluation: List[Dict[str, object]] = []
+
+    def add_criterion(
+        name: str,
+        status: str,
+        level: str,
+        threshold: str,
+        observed: str,
+        impact: str,
+    ) -> None:
+        criteria_evaluation.append(
+            {
+                "name": name,
+                "status": status,
+                "level": level,
+                "threshold": threshold,
+                "observed": observed,
+                "impact": impact,
+            }
+        )
+
+    add_criterion(
+        name="data_complete",
+        status="pass" if all_phases_complete else "fail",
+        level="normal" if all_phases_complete else "none",
+        threshold="All 4 phases completed",
+        observed=(
+            "completed phases: " + ", ".join([phase for phase, ok in phase_complete.items() if ok])
+            if any(phase_complete.values())
+            else "completed phases: none"
+        ),
+        impact="inconclusive_on_fail",
+    )
+
+    add_criterion(
+        name="comparable_cpu_or_gpu_sensors_available",
+        status="pass" if has_comparable_cpu_gpu else "fail",
+        level="normal" if has_comparable_cpu_gpu else "none",
+        threshold="At least one comparable CPU or GPU temperature sensor across cooled and uncooled phases",
+        observed=(
+            "comparable sensors: " + ", ".join(comparable_cpu_gpu_sensors)
+            if comparable_cpu_gpu_sensors
+            else "comparable sensors: none"
+        ),
+        impact="inconclusive_on_fail",
+    )
+
+    if min_samples < 5:
+        minimum_samples_status = "fail"
+        minimum_samples_level = "none"
+    elif min_samples < 10:
+        minimum_samples_status = "warning"
+        minimum_samples_level = "weak"
     else:
+        minimum_samples_status = "pass"
+        minimum_samples_level = "normal"
+    add_criterion(
+        name="minimum_samples_met",
+        status=minimum_samples_status,
+        level=minimum_samples_level,
+        threshold="Each phase has >=10 samples (warning 5-9, fail <5)",
+        observed="sample counts: " + ", ".join(f"{phase}={count}" for phase, count in sample_counts.items()),
+        impact="inconclusive_on_fail",
+    )
+
+    idle_improved = idle_best_cpu_gpu_drop is not None and idle_best_cpu_gpu_drop > 0.0
+    idle_strong = idle_best_cpu_gpu_drop is not None and idle_best_cpu_gpu_drop >= 3.0
+    add_criterion(
+        name="idle_temperature_improved",
+        status="pass" if idle_improved else "fail",
+        level="strong" if idle_strong else ("normal" if idle_improved else "none"),
+        threshold="Idle CPU/GPU temperature decreases with cooler (strong >=3 C drop)",
+        observed=(
+            f"idle CPU drop={idle_cpu_drop}, idle GPU drop={idle_gpu_drop}"
+        ),
+        impact="mandatory_keep_gate",
+    )
+
+    idle_penalty_fail = idle_worst_cpu_gpu_drop is not None and idle_worst_cpu_gpu_drop < -2.0
+    add_criterion(
+        name="idle_no_heat_penalty",
+        status="fail" if idle_penalty_fail else "pass",
+        level="none" if idle_penalty_fail else "normal",
+        threshold="No idle CPU/GPU temperature more than 2 C hotter",
+        observed=(
+            f"worst idle CPU/GPU delta={idle_worst_cpu_gpu_drop:.1f} C"
+            if idle_worst_cpu_gpu_drop is not None
+            else "no idle CPU/GPU data"
+        ),
+        impact="return_on_fail",
+    )
+
+    if stress_best_cpu_gpu_drop is None:
+        stress_temp_status = "fail"
+        stress_temp_level = "none"
+    elif stress_best_cpu_gpu_drop >= 8.0:
+        stress_temp_status = "pass"
+        stress_temp_level = "very_strong"
+    elif stress_best_cpu_gpu_drop >= 5.0:
+        stress_temp_status = "pass"
+        stress_temp_level = "strong"
+    elif stress_best_cpu_gpu_drop > 0.0:
+        stress_temp_status = "pass"
+        stress_temp_level = "normal"
+    else:
+        stress_temp_status = "fail"
+        stress_temp_level = "none"
+    add_criterion(
+        name="stress_temperature_improved",
+        status=stress_temp_status,
+        level=stress_temp_level,
+        threshold="Stress CPU/GPU temperature drops (strong >=5 C, very strong >=8 C)",
+        observed=(
+            f"stress CPU drop={stress_cpu_drop}, stress GPU drop={stress_gpu_drop}"
+        ),
+        impact="main_stress_condition",
+    )
+
+    if not has_stress_clock_data:
+        stress_clock_status = "warning"
+        stress_clock_level = "weak"
+    elif stress_freq_gain >= 5.0:
+        stress_clock_status = "pass"
+        stress_clock_level = "strong"
+    elif stress_freq_gain >= 3.0:
+        stress_clock_status = "pass"
+        stress_clock_level = "normal"
+    else:
+        stress_clock_status = "fail"
+        stress_clock_level = "none"
+    add_criterion(
+        name="stress_clock_speed_improved",
+        status=stress_clock_status,
+        level=stress_clock_level,
+        threshold="Stress clock gain >=3% (strong >=5%)",
+        observed=(
+            f"stress CPU clock gain={stress_freq_gain:.1f}%"
+            if has_stress_clock_data
+            else "stress clock data unavailable"
+        ),
+        impact="used_for_tradeoff",
+    )
+
+    stress_tradeoff_pass = (
+        stress_worst_cpu_gpu_drop is not None
+        and stress_worst_cpu_gpu_drop >= -3.0
+        and stress_best_cpu_gpu_drop is not None
+        and stress_best_cpu_gpu_drop <= 0.0
+        and stress_freq_gain >= 3.0
+    )
+    stress_tradeoff_fail = (
+        stress_best_cpu_gpu_drop is not None
+        and stress_best_cpu_gpu_drop <= 0.0
+        and stress_freq_gain < 3.0
+    )
+    if stress_tradeoff_pass:
+        stress_tradeoff_status = "pass"
+        stress_tradeoff_level = "strong" if stress_freq_gain >= 5.0 else "normal"
+    elif stress_tradeoff_fail:
+        stress_tradeoff_status = "fail"
+        stress_tradeoff_level = "none"
+    else:
+        stress_tradeoff_status = "warning"
+        stress_tradeoff_level = "weak"
+    add_criterion(
+        name="stress_performance_positive_tradeoff",
+        status=stress_tradeoff_status,
+        level=stress_tradeoff_level,
+        threshold="Stress temperature same to +3 C hotter with >=3% stress clock gain",
+        observed=(
+            f"stress worst CPU/GPU delta={stress_worst_cpu_gpu_drop}, stress clock gain={stress_freq_gain:.1f}%"
+        ),
+        impact="alternative_stress_keep_condition",
+    )
+
+    stress_penalty_fail = (
+        stress_worst_cpu_gpu_drop is not None
+        and stress_worst_cpu_gpu_drop < -3.0
+        and stress_freq_gain < 3.0
+    )
+    add_criterion(
+        name="stress_no_unjustified_heat_penalty",
+        status="fail" if stress_penalty_fail else "pass",
+        level="none" if stress_penalty_fail else "normal",
+        threshold="No stress CPU/GPU more than 3 C hotter without >=3% clock gain",
+        observed=(
+            f"stress worst CPU/GPU delta={stress_worst_cpu_gpu_drop}, stress clock gain={stress_freq_gain:.1f}%"
+        ),
+        impact="return_on_fail",
+    )
+
+    keep_requirements_met = idle_improved and (
+        stress_temp_status == "pass" or stress_tradeoff_status == "pass"
+    ) and not stress_penalty_fail and not idle_penalty_fail
+    add_criterion(
+        name="keep_requirements_met",
+        status="pass" if keep_requirements_met else "fail",
+        level="normal" if keep_requirements_met else "none",
+        threshold="Idle improved AND (stress temp improved OR stress tradeoff passed)",
+        observed=(
+            f"idle_improved={idle_improved}, stress_temp_pass={stress_temp_status == 'pass'}, "
+            f"stress_tradeoff_pass={stress_tradeoff_status == 'pass'}, penalties={idle_penalty_fail or stress_penalty_fail}"
+        ),
+        impact="enables_keep",
+    )
+
+    definitely_keep_requirements_met = (
+        keep_requirements_met
+        and (stress_best_cpu_gpu_drop is not None and stress_best_cpu_gpu_drop >= 5.0)
+        and not stress_penalty_fail
+    )
+    definitely_keep_level = "strong"
+    if stress_best_cpu_gpu_drop is not None and stress_best_cpu_gpu_drop >= 8.0:
+        definitely_keep_level = "very_strong"
+    add_criterion(
+        name="definitely_keep_requirements_met",
+        status="pass" if definitely_keep_requirements_met else "fail",
+        level=definitely_keep_level if definitely_keep_requirements_met else "none",
+        threshold="Keep requirements plus strong stress drop (>=5 C, very strong >=8 C)",
+        observed=(
+            f"stress_best_drop={stress_best_cpu_gpu_drop}, stress_clock_gain={stress_freq_gain:.1f}%"
+        ),
+        impact="enables_definitely_keep",
+    )
+
+    data_quality_failed = (
+        not all_phases_complete
+        or not has_comparable_cpu_gpu
+        or minimum_samples_status == "fail"
+    )
+    tradeoff_needs_clock_but_missing = (
+        stress_best_cpu_gpu_drop is not None
+        and stress_best_cpu_gpu_drop <= 0.0
+        and not has_stress_clock_data
+    )
+    stress_failed = (
+        (stress_temp_status != "pass") and (stress_tradeoff_status != "pass")
+    )
+    marginal_result = (
+        (idle_best_cpu_gpu_drop is None or idle_best_cpu_gpu_drop < 3.0)
+        and (stress_best_cpu_gpu_drop is None or stress_best_cpu_gpu_drop < 3.0)
+        and stress_freq_gain < 3.0
+    )
+
+    if data_quality_failed:
         verdict = "inconclusive"
-        keep = False
-        reason = "mixed or limited data"
+        reason = "missing phase, sensor comparability, or minimum sample requirements"
+        applied_rule_id = "inconclusive_data_quality_failure"
+    elif tradeoff_needs_clock_but_missing:
+        verdict = "inconclusive"
+        reason = "stress tradeoff cannot be evaluated because stress clock data is unavailable"
+        applied_rule_id = "inconclusive_missing_clock_data"
+    elif idle_penalty_fail:
+        verdict = "return"
+        reason = "idle temperatures increased by more than 2 C"
+        applied_rule_id = "return_idle_heat_penalty"
+    elif not idle_improved:
+        if stress_temp_status == "pass" or stress_tradeoff_status == "pass":
+            verdict = "return"
+            reason = "stress looked useful but idle did not improve"
+            applied_rule_id = "return_idle_gate_failed"
+        else:
+            verdict = "return"
+            reason = "idle temperatures did not improve and stress showed no useful benefit"
+            applied_rule_id = "return_idle_not_improved"
+    elif stress_penalty_fail:
+        verdict = "return"
+        reason = "stress temperatures were more than 3 C hotter without meaningful clock gain"
+        applied_rule_id = "return_stress_heat_penalty"
+    elif stress_failed:
+        verdict = "return"
+        reason = "stress temperatures did not improve and stress clocks did not improve"
+        applied_rule_id = "return_stress_failed"
+    elif marginal_result:
+        verdict = "probably_return"
+        reason = "idle and stress improvements were both marginal"
+        applied_rule_id = "return_marginal_result"
+    elif definitely_keep_requirements_met:
+        verdict = "definitely_keep"
+        reason = "idle improved and stress showed strong benefit without major penalty"
+        applied_rule_id = "definitely_keep_requirements_met"
+    elif keep_requirements_met:
+        verdict = "keep"
+        reason = "idle improved and stress showed practical cooling/performance benefit"
+        applied_rule_id = "keep_requirements_met"
+    else:
+        verdict = "return"
+        reason = "mixed results"
+        applied_rule_id = "return_mixed_results"
+
+    keep = verdict in ("keep", "definitely_keep")
 
     clock_tradeoff_note = None
     if any((v is not None and v < 0.0) for v in all_temp_drops) and best_freq_gain >= 3.0:
         clock_tradeoff_note = "Some phases ran hotter while CPU clocks increased."
 
+    verdict_short = "KEEP" if verdict == "keep" else (
+        "DEFINITELY KEEP" if verdict == "definitely_keep" else (
+            "INCONCLUSIVE" if verdict == "inconclusive" else "RETURN"
+        )
+    )
     summary_short = (
-        f"Verdict: {'KEEP' if keep else 'RETURN'}. "
+        f"Verdict: {verdict_short}. "
         f"Best temp drop {best_temp_drop:.1f}C, best CPU clock gain {best_freq_gain:.1f}%."
     )
 
@@ -530,14 +929,16 @@ def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
         "verdict": verdict,
         "keep_recommended": keep,
         "reason": reason,
+        "applied_rule_id": applied_rule_id,
         "summary_short": summary_short,
-        "noise_considered": False,
         "clock_tradeoff_note": clock_tradeoff_note,
         "best_temp_drop_c": round(best_temp_drop, 3),
         "worst_temp_drop_c": round(worst_temp_drop, 3),
         "best_cpu_freq_gain_pct": round(best_freq_gain, 3),
         "phase_stats": phase_stats,
         "comparisons": comparisons,
+        "sensor_temp_drop_summary": sensor_temp_drop_summary,
+        "criteria_evaluation": criteria_evaluation,
     }
 
 
@@ -785,6 +1186,12 @@ def parse_cli_args() -> argparse.Namespace:
         default=3.0,
         help="CPU percent threshold for reporting potentially interfering processes.",
     )
+    parser.add_argument(
+        "--steady-timeout-sec",
+        type=int,
+        default=900,
+        help="Maximum seconds to wait for steady-state between phases (default: 900).",
+    )
     return parser.parse_args()
 
 
@@ -841,6 +1248,7 @@ def cli_main() -> int:
             if idx < len(phases) - 1:
                 summary["post_phase_steady_state"] = wait_until_temperatures_steady(
                     interval_sec=args.interval_sec,
+                    timeout_sec=max(1, int(args.steady_timeout_sec)),
                 )
 
             phase_summaries.append(summary)
@@ -850,6 +1258,7 @@ def cli_main() -> int:
         "started_utc": utc_now_iso(),
         "duration_per_phase_min": args.duration_min,
         "interval_sec": args.interval_sec,
+        "steady_timeout_sec": max(1, int(args.steady_timeout_sec)),
         "cpu_workers": args.cpu_workers,
         "gpu_stress_cmd": args.gpu_stress_cmd,
         "gpu_vendor_guess": infer_gpu_vendor(),
@@ -885,7 +1294,7 @@ try:
     from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
     from matplotlib.colors import to_hex
     from matplotlib.figure import Figure
-    from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+    from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
     from PyQt5.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -902,6 +1311,7 @@ try:
         QPushButton,
         QScrollArea,
         QSizePolicy,
+        QStackedWidget,
         QSplitter,
         QSpinBox,
         QToolButton,
@@ -961,10 +1371,11 @@ if GUI_DEPS_AVAILABLE:
         dialog_info_requested = pyqtSignal(str, str)
         dialog_error_requested = pyqtSignal(str, str)
         cooler_confirm_requested = pyqtSignal(bool)
+        cooler_assessment_ready = pyqtSignal(object)
 
         def __init__(self) -> None:
             super().__init__()
-            self.setWindowTitle("Cooler Verdict - Interactive Dashboard v3")
+            self.setWindowTitle("Cooler Verdict - Interactive Dashboard")
             self.setMinimumSize(1180, 740)
             self.resize(1520, 920)
 
@@ -994,6 +1405,7 @@ if GUI_DEPS_AVAILABLE:
             self.phase_cards: Dict[str, QFrame] = {}
             self.phase_card_labels: Dict[str, QLabel] = {}
             self._hovered_sensor: Optional[str] = None
+            self.current_cooler_assessment: Optional[dict] = None
 
             self.figure = Figure(figsize=(9.5, 4.8), dpi=100)
             self.ax = self.figure.add_subplot(111)
@@ -1035,6 +1447,7 @@ if GUI_DEPS_AVAILABLE:
             self.dialog_info_requested.connect(self._show_info_dialog)
             self.dialog_error_requested.connect(self._show_error_dialog)
             self.cooler_confirm_requested.connect(self._show_cooler_confirmation)
+            self.cooler_assessment_ready.connect(self._apply_cooler_assessment)
 
         def _build_layout(self) -> None:
             """Build a three-pane benchmark dashboard.
@@ -1153,6 +1566,11 @@ if GUI_DEPS_AVAILABLE:
                     border: 1px solid #e2e8f0;
                     border-radius: 8px;
                 }
+                QFrame#SummaryOverlay {
+                    background: rgba(255, 255, 255, 238);
+                    border: 1px solid #bfdbfe;
+                    border-radius: 10px;
+                }
                 """
             )
 
@@ -1173,7 +1591,7 @@ if GUI_DEPS_AVAILABLE:
             title_col.setSpacing(2)
             title = QLabel("Cooler Verdict")
             title.setObjectName("HeroTitle")
-            subtitle = QLabel("Interactive dashboard v3: configure the test, monitor live sensor plots, hover lines for sensor identity, and get a keep/return verdict.")
+            subtitle = QLabel("Interactive dashboard: configure the test, monitor live sensor plots, hover lines for sensor identity, and get a keep/return verdict.")
             subtitle.setObjectName("Muted")
             subtitle.setWordWrap(True)
             title_col.addWidget(title)
@@ -1312,6 +1730,11 @@ if GUI_DEPS_AVAILABLE:
             self.cpu_threshold_spin.setValue(3.0)
             self.cpu_threshold_spin.setSuffix(" %")
 
+            self.steady_timeout_spin = QSpinBox()
+            self.steady_timeout_spin.setRange(10, 36000)
+            self.steady_timeout_spin.setValue(900)
+            self.steady_timeout_spin.setSuffix(" sec")
+
             self.gpu_stress_cmd_edit = QLineEdit()
             self.gpu_stress_cmd_edit.setPlaceholderText("Optional shell command")
             self.enforce_clean_checkbox = QCheckBox("Abort if busy user processes are active")
@@ -1320,6 +1743,7 @@ if GUI_DEPS_AVAILABLE:
             setup_form.addRow("Sample interval", self.interval_spin)
             setup_form.addRow("CPU workers", self.cpu_workers_spin)
             setup_form.addRow("CPU threshold", self.cpu_threshold_spin)
+            setup_form.addRow("Steady timeout", self.steady_timeout_spin)
             setup_form.addRow("GPU stress", self.gpu_stress_cmd_edit)
             setup_form.addRow("Clean guard", self.enforce_clean_checkbox)
             left_layout.addWidget(setup_box)
@@ -1382,21 +1806,78 @@ if GUI_DEPS_AVAILABLE:
             plot_title_col.addWidget(plot_title)
             plot_title_col.addWidget(plot_subtitle)
             plot_header.addLayout(plot_title_col, stretch=1)
+            self.summary_toggle_button = QPushButton("Show summary")
+            self.summary_toggle_button.setCheckable(True)
+            self.summary_toggle_button.setEnabled(False)
             self.show_all_button = QPushButton("Show all")
             self.hide_all_button = QPushButton("Hide all")
+            plot_header.addWidget(self.summary_toggle_button)
             plot_header.addWidget(self.show_all_button)
             plot_header.addWidget(self.hide_all_button)
             plot_layout.addLayout(plot_header)
 
+            self.center_stack = QStackedWidget()
+
+            timeline_page = QWidget()
+            timeline_layout = QVBoxLayout(timeline_page)
+            timeline_layout.setContentsMargins(0, 0, 0, 0)
+            timeline_layout.setSpacing(8)
             self.toolbar = NavigationToolbar(self.canvas, self)
-            plot_layout.addWidget(self.toolbar)
+            timeline_layout.addWidget(self.toolbar)
             self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self.canvas.setMinimumHeight(520)
-            plot_layout.addWidget(self.canvas, stretch=1)
+            timeline_layout.addWidget(self.canvas, stretch=1)
             self.hover_value_label = QLabel("Hover over a plotted line to see the sensor name and value.")
             self.hover_value_label.setObjectName("Muted")
             self.hover_value_label.setWordWrap(True)
-            plot_layout.addWidget(self.hover_value_label)
+            timeline_layout.addWidget(self.hover_value_label)
+
+            summary_page = QWidget()
+            summary_page_layout = QVBoxLayout(summary_page)
+            summary_page_layout.setContentsMargins(0, 0, 0, 0)
+            summary_page_layout.setSpacing(8)
+            summary_title = QLabel("Results summary")
+            summary_title.setStyleSheet("font-size: 16px; font-weight: 800; color: #111827;")
+            summary_page_layout.addWidget(summary_title)
+
+            summary_scroll = QScrollArea()
+            summary_scroll.setWidgetResizable(True)
+            summary_scroll.setFrameShape(QFrame.NoFrame)
+            summary_content = QWidget()
+            summary_scroll.setWidget(summary_content)
+            summary_content_layout = QVBoxLayout(summary_content)
+            summary_content_layout.setContentsMargins(0, 0, 0, 0)
+            summary_content_layout.setSpacing(8)
+
+            self.summary_verdict_label = QLabel("Verdict pending")
+            self.summary_verdict_label.setStyleSheet(
+                "font-weight: 800; padding: 3px 8px; border-radius: 8px; "
+                "background: #e5e7eb; color: #334155;"
+            )
+            self.summary_reason_label = QLabel("Run all phases to generate a verdict.")
+            self.summary_reason_label.setWordWrap(True)
+            self.summary_decision_label = QLabel("")
+            self.summary_decision_label.setWordWrap(True)
+            self.summary_metrics_label = QLabel("")
+            self.summary_metrics_label.setWordWrap(True)
+            self.summary_criteria_label = QLabel("")
+            self.summary_criteria_label.setWordWrap(True)
+            self.summary_criteria_label.setTextFormat(Qt.RichText)
+            self.summary_criteria_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+            summary_content_layout.addWidget(self.summary_verdict_label)
+            summary_content_layout.addWidget(self.summary_reason_label)
+            summary_content_layout.addWidget(self.summary_decision_label)
+            summary_content_layout.addWidget(self.summary_metrics_label)
+            summary_content_layout.addWidget(self.summary_criteria_label)
+            summary_content_layout.addStretch(1)
+            summary_page_layout.addWidget(summary_scroll, stretch=1)
+
+            self.center_stack.addWidget(timeline_page)
+            self.center_stack.addWidget(summary_page)
+            self.center_stack.setCurrentIndex(0)
+
+            plot_layout.addWidget(self.center_stack, stretch=1)
             centre_layout.addWidget(plot_card, stretch=1)
             main_splitter.addWidget(centre)
 
@@ -1438,6 +1919,7 @@ if GUI_DEPS_AVAILABLE:
             self.start_button.clicked.connect(self.start_testing)
             self.stop_button.clicked.connect(self.stop_testing)
             self.check_button.clicked.connect(self.check_running_processes)
+            self.summary_toggle_button.toggled.connect(self._toggle_summary_overlay)
             self.show_all_button.clicked.connect(lambda: self._set_all_plot_visibility(True))
             self.hide_all_button.clicked.connect(lambda: self._set_all_plot_visibility(False))
 
@@ -1445,6 +1927,209 @@ if GUI_DEPS_AVAILABLE:
             self._poll_active = True
             self._poll_live_temps()
             self.live_poll_timer.start()
+
+        def _toggle_summary_overlay(self, checked: bool) -> None:
+            self._set_summary_overlay_visible(checked)
+
+        def _set_summary_overlay_visible(self, visible: bool) -> None:
+            can_show = self.current_cooler_assessment is not None
+            show = bool(visible and can_show)
+            self.center_stack.setCurrentIndex(1 if show else 0)
+            self.summary_toggle_button.blockSignals(True)
+            self.summary_toggle_button.setChecked(show)
+            self.summary_toggle_button.setText("Show timeline" if show else "Show summary")
+            self.summary_toggle_button.blockSignals(False)
+            self.show_all_button.setEnabled(not show)
+            self.hide_all_button.setEnabled(not show)
+
+        def _reset_summary_panel(self) -> None:
+            self.current_cooler_assessment = None
+            self.summary_verdict_label.setText("Verdict pending")
+            self.summary_verdict_label.setStyleSheet(
+                "font-weight: 800; padding: 3px 8px; border-radius: 8px; "
+                "background: #e5e7eb; color: #334155;"
+            )
+            self.summary_reason_label.setText("Run all phases to generate a verdict.")
+            self.summary_decision_label.setText("")
+            self.summary_metrics_label.setText("")
+            self.summary_criteria_label.setText("")
+            self.summary_toggle_button.setEnabled(False)
+            self._set_summary_overlay_visible(False)
+
+        def _apply_cooler_assessment(self, assessment_obj: object) -> None:
+            if not isinstance(assessment_obj, dict):
+                return
+
+            self.current_cooler_assessment = assessment_obj
+            keep = bool(assessment_obj.get("keep_recommended"))
+            verdict_text = "KEEP" if keep else "RETURN"
+            verdict_bg = "#dcfce7" if keep else "#fee2e2"
+            verdict_fg = "#166534" if keep else "#991b1b"
+            self.summary_verdict_label.setText(f"Verdict: {verdict_text}")
+            self.summary_verdict_label.setStyleSheet(
+                "font-weight: 800; padding: 3px 8px; border-radius: 8px; "
+                f"background: {verdict_bg}; color: {verdict_fg};"
+            )
+
+            reason = str(assessment_obj.get("reason") or "No reason provided")
+            best_drop = float(assessment_obj.get("best_temp_drop_c") or 0.0)
+            worst_drop = float(assessment_obj.get("worst_temp_drop_c") or 0.0)
+            best_freq = float(assessment_obj.get("best_cpu_freq_gain_pct") or 0.0)
+            self.summary_reason_label.setText(
+                "Decision criteria use CPU/GPU temperature behavior plus CPU speed. "
+                "The sensor list below includes all detected temperature sensors."
+            )
+            self.summary_decision_label.setText(f"Decision: {reason}.")
+            self.summary_metrics_label.setText(
+                f"Cooling change: up to {best_drop:.1f} C cooler. "
+                f"Worst downside: up to {abs(min(0.0, worst_drop)):.1f} C hotter. "
+                f"CPU speed change: up to {best_freq:.1f}% higher."
+            )
+
+            criteria = assessment_obj.get("criteria_evaluation") or []
+            criteria_map: Dict[str, str] = {}
+            for item in criteria:
+                if not isinstance(item, dict):
+                    continue
+                item_name = str(item.get("name") or "")
+                criteria_map[item_name] = str(item.get("status") or "")
+
+            reject_guard_hit = criteria_map.get("stress_no_unjustified_heat_penalty") == "fail"
+            idle_improved_check = criteria_map.get("idle_temperature_improved") == "pass"
+
+            checks = [
+                ("Test completed", criteria_map.get("data_complete") == "pass"),
+                (
+                    "Enough sensor data",
+                    criteria_map.get("comparable_cpu_or_gpu_sensors_available") == "pass",
+                ),
+                ("Idle temperatures improved", idle_improved_check),
+                ("No severe stress heat penalty", not reject_guard_hit),
+                ("Stress cooling improved", criteria_map.get("stress_temperature_improved") == "pass"),
+                ("Stress clock improved", criteria_map.get("stress_clock_speed_improved") == "pass"),
+                (
+                    "Overall improvement meaningful",
+                    best_drop >= 5.0 or best_freq >= 5.0,
+                ),
+                ("Keep requirements met", criteria_map.get("keep_requirements_met") == "pass"),
+            ]
+
+            passed_checks = [label for label, passed in checks if passed]
+            failed_checks = [label for label, passed in checks if not passed]
+
+            passed_html = "".join(
+                f"<div style='margin: 3px 0; color:#166534;'>Pass: {label}</div>" for label in passed_checks
+            )
+            failed_html = "".join(
+                f"<div style='margin: 3px 0; color:#991b1b;'>Fail: {label}</div>" for label in failed_checks
+            )
+
+            if not passed_html:
+                passed_html = "<div style='margin: 3px 0; color:#64748b;'>No passing checks.</div>"
+            if not failed_html:
+                failed_html = "<div style='margin: 3px 0; color:#64748b;'>No failed checks.</div>"
+
+            reject_reason_text = "None" if keep else reason
+
+            sensor_rows = assessment_obj.get("sensor_temp_drop_summary") or []
+            sensor_table_rows: List[str] = []
+            for row in sensor_rows:
+                if not isinstance(row, dict):
+                    continue
+                sensor_key = str(row.get("sensor") or "")
+                if not sensor_key:
+                    continue
+                idle_pct = row.get("idle_drop_pct")
+                stress_pct = row.get("stress_drop_pct")
+
+                def _fmt_pct(value: object) -> str:
+                    if value is None:
+                        return "n/a"
+                    try:
+                        return f"{float(value):+.1f}%"
+                    except (TypeError, ValueError):
+                        return "n/a"
+
+                sensor_name = self._format_sensor_label(sensor_key)
+                sensor_table_rows.append(
+                    "<tr>"
+                    f"<td style='padding:2px 6px; color:#334155;'>{sensor_name}</td>"
+                    f"<td style='padding:2px 6px; color:#334155;'>{_fmt_pct(idle_pct)}</td>"
+                    f"<td style='padding:2px 6px; color:#334155;'>{_fmt_pct(stress_pct)}</td>"
+                    "</tr>"
+                )
+
+            if sensor_table_rows:
+                sensor_section_html = (
+                    "<table style='border-collapse:collapse; width:100%;'>"
+                    "<thead><tr>"
+                    "<th style='text-align:left; padding:3px 6px; color:#0f172a;'>Sensor</th>"
+                    "<th style='text-align:left; padding:3px 6px; color:#0f172a;'>Idle</th>"
+                    "<th style='text-align:left; padding:3px 6px; color:#0f172a;'>Stress</th>"
+                    "</tr></thead>"
+                    "<tbody>"
+                    + "".join(sensor_table_rows)
+                    + "</tbody></table>"
+                )
+            else:
+                sensor_section_html = "<div style='margin: 2px 0; color:#64748b;'>No sensor drop data available.</div>"
+
+            criteria_table_rows: List[str] = []
+            for item in criteria:
+                if not isinstance(item, dict):
+                    continue
+                name_text = html.escape(str(item.get("name") or ""))
+                status_text = html.escape(str(item.get("status") or ""))
+                level_text = html.escape(str(item.get("level") or ""))
+                threshold_text = html.escape(str(item.get("threshold") or ""))
+                observed_text = html.escape(str(item.get("observed") or ""))
+                impact_text = html.escape(str(item.get("impact") or ""))
+                if not name_text:
+                    continue
+                criteria_table_rows.append(
+                    "<tr>"
+                    f"<td style='padding:2px 6px; color:#334155;'>{name_text}</td>"
+                    f"<td style='padding:2px 6px; color:#334155;'>{status_text}</td>"
+                    f"<td style='padding:2px 6px; color:#334155;'>{level_text}</td>"
+                    f"<td style='padding:2px 6px; color:#334155;'>{threshold_text}</td>"
+                    f"<td style='padding:2px 6px; color:#334155;'>{observed_text}</td>"
+                    f"<td style='padding:2px 6px; color:#334155;'>{impact_text}</td>"
+                    "</tr>"
+                )
+
+            if criteria_table_rows:
+                criteria_table_html = (
+                    "<table style='border-collapse:collapse; width:100%;'>"
+                    "<thead><tr>"
+                    "<th style='text-align:left; padding:3px 6px; color:#0f172a;'>Name</th>"
+                    "<th style='text-align:left; padding:3px 6px; color:#0f172a;'>Status</th>"
+                    "<th style='text-align:left; padding:3px 6px; color:#0f172a;'>Level</th>"
+                    "<th style='text-align:left; padding:3px 6px; color:#0f172a;'>Threshold</th>"
+                    "<th style='text-align:left; padding:3px 6px; color:#0f172a;'>Observed</th>"
+                    "<th style='text-align:left; padding:3px 6px; color:#0f172a;'>Impact</th>"
+                    "</tr></thead>"
+                    "<tbody>"
+                    + "".join(criteria_table_rows)
+                    + "</tbody></table>"
+                )
+            else:
+                criteria_table_html = "<div style='margin: 2px 0; color:#64748b;'>No criteria metadata available.</div>"
+
+            self.summary_criteria_label.setText(
+                "<b>What passed</b><br/>"
+                + passed_html
+                + "<br/><b>What failed</b><br/>"
+                + failed_html
+                + "<br/><b>Reject reason</b><br/>"
+                + f"<div style='margin: 3px 0; color:#334155;'>{reject_reason_text}.</div>"
+                + "<br/><b>Temperature drop by sensor (%)</b><br/>"
+                + sensor_section_html
+                + "<br/><b>Criteria table</b><br/>"
+                + criteria_table_html
+            )
+
+            self.summary_toggle_button.setEnabled(True)
+            self._set_summary_overlay_visible(False)
 
         def _detect_and_set_specs(self) -> None:
             try:
@@ -1534,6 +2219,10 @@ if GUI_DEPS_AVAILABLE:
             except Exception as exc:
                 storage_str = f"Unknown ({exc})"
             self.storage_spec_label.setText(storage_str)
+
+        def _on_steady_progress(self, elapsed_sec: int, remaining_sec: int, timeout_sec: int) -> None:
+            self._set_phase(f"steady_state_check ({elapsed_sec}s/{timeout_sec}s)")
+            self._set_remaining_seconds(remaining_sec)
 
         def _set_status(self, text: str) -> None:
             self.status_changed.emit(text)
@@ -2068,6 +2757,7 @@ if GUI_DEPS_AVAILABLE:
             interval_sec = float(self.interval_spin.value())
             cpu_workers = int(self.cpu_workers_spin.value())
             cpu_threshold = float(self.cpu_threshold_spin.value())
+            steady_timeout_sec = int(self.steady_timeout_spin.value())
 
             offenders = find_busy_user_processes(cpu_threshold=cpu_threshold)
             if offenders and self.enforce_clean_checkbox.isChecked():
@@ -2085,6 +2775,7 @@ if GUI_DEPS_AVAILABLE:
             self.phase_summaries = []
             self.run_started_epoch = time.time()
             self.plot_origin_epoch = self.run_started_epoch
+            self._reset_summary_panel()
 
             known_sensors = sorted(self.sensor_display_names) or sorted(self.sensor_data)
             self.sensor_data = {sensor: [] for sensor in known_sensors}
@@ -2096,7 +2787,13 @@ if GUI_DEPS_AVAILABLE:
 
             self.worker_thread = threading.Thread(
                 target=self._run_test_worker,
-                args=(duration_min, interval_sec, cpu_workers, self.gpu_stress_cmd_edit.text().strip()),
+                args=(
+                    duration_min,
+                    interval_sec,
+                    cpu_workers,
+                    self.gpu_stress_cmd_edit.text().strip(),
+                    steady_timeout_sec,
+                ),
                 daemon=True,
             )
             self.worker_thread.start()
@@ -2217,14 +2914,20 @@ if GUI_DEPS_AVAILABLE:
                 f"Cooler verdict: {headline}",
                 f"Result: {reason}.",
                 f"Best temp drop: {best_drop:.1f} C | Best CPU clock gain: {freq_gain:.1f}%.",
-                "Noise not scored (not measured).",
             ]
             tradeoff = assessment.get("clock_tradeoff_note")
             if tradeoff:
                 lines.append(tradeoff)
             return "\n".join(lines)
 
-        def _run_test_worker(self, duration_min: int, interval_sec: float, cpu_workers: int, gpu_stress_cmd: str) -> None:
+        def _run_test_worker(
+            self,
+            duration_min: int,
+            interval_sec: float,
+            cpu_workers: int,
+            gpu_stress_cmd: str,
+            steady_timeout_sec: int,
+        ) -> None:
             out_dir = Path("results")
             out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2269,9 +2972,13 @@ if GUI_DEPS_AVAILABLE:
 
                         phase_index = len(self.phase_summaries)
                         if phase_index < len(phases) - 1 and not self.stop_event.is_set():
+                            self._set_status("Waiting for temperatures to reach steady state...")
                             summary["post_phase_steady_state"] = wait_until_temperatures_steady(
                                 interval_sec=interval_sec,
+                                timeout_sec=max(1, int(steady_timeout_sec)),
                                 status_cb=self._set_status,
+                                progress_cb=self._on_steady_progress,
+                                cancel_cb=self.stop_event.is_set,
                             )
 
                         self.phase_summaries.append(summary)
@@ -2284,6 +2991,7 @@ if GUI_DEPS_AVAILABLE:
                     "created_utc": utc_now_iso(),
                     "duration_per_phase_min": duration_min,
                     "interval_sec": interval_sec,
+                    "steady_timeout_sec": max(1, int(steady_timeout_sec)),
                     "cpu_workers": cpu_workers,
                     "gpu_stress_cmd": gpu_stress_cmd,
                     "gpu_vendor_guess": infer_gpu_vendor(),
@@ -2299,6 +3007,7 @@ if GUI_DEPS_AVAILABLE:
                 if not self.stop_event.is_set() and len(self.phase_summaries) == len(phases):
                     cooler_assessment = summarize_cooler_effect_from_csv(csv_path)
                     metadata["cooler_assessment"] = cooler_assessment
+                    self.cooler_assessment_ready.emit(cooler_assessment)
 
                 metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
 
@@ -2401,7 +3110,13 @@ if GUI_DEPS_AVAILABLE:
         duration_min = 0.15
         interval_sec = 0.5
         thr = threading.Thread(
-            target=lambda: win._run_test_worker(duration_min=duration_min, interval_sec=interval_sec, cpu_workers=1, gpu_stress_cmd=""),
+            target=lambda: win._run_test_worker(
+                duration_min=duration_min,
+                interval_sec=interval_sec,
+                cpu_workers=1,
+                gpu_stress_cmd="",
+                steady_timeout_sec=120,
+            ),
             daemon=True,
         )
         thr.start()
