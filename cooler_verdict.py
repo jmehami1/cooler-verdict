@@ -50,12 +50,229 @@ def utc_now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+def _is_valid_temperature_c(temp: float) -> bool:
+    """Check if a temperature reading is physically reasonable (in Celsius).
+    
+    Rejects NaN, inf, and values outside -50°C to 150°C range.
+    """
+    if temp is None or math.isnan(temp) or math.isinf(temp):
+        return False
+    return -50.0 <= temp <= 150.0
+
+
+def _is_valid_cpu_frequency_mhz(freq: float) -> bool:
+    """Check if a CPU frequency reading is physically reasonable (in MHz).
+    
+    Rejects NaN, inf, and values outside 1 MHz to 10000 MHz range.
+    """
+    if freq is None or math.isnan(freq) or math.isinf(freq):
+        return False
+    return 1.0 <= freq <= 10000.0
+
+
+def detect_nvidia_gpu() -> Optional[str]:
+    """Detect NVIDIA GPU. Returns device name if found, None otherwise."""
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True,
+            stderr=subprocess.DEVNULL
+        )
+        gpus = [line.strip() for line in output.strip().splitlines() if line.strip()]
+        return gpus[0] if gpus else None
+    except Exception:
+        return None
+
+
+def detect_amd_gpu() -> Optional[str]:
+    """Detect AMD GPU (RDNA, NAVI, etc). Returns device name if found, None otherwise."""
+    # Check for rocm-smi (AMD GPU driver)
+    if shutil.which("rocm-smi"):
+        try:
+            output = subprocess.check_output(
+                ["rocm-smi", "--showid"],
+                text=True,
+                stderr=subprocess.DEVNULL
+            )
+            if output and "GPU ID" in output:
+                return "AMD Radeon (ROCm)"
+        except Exception:
+            pass
+    
+    # Check for AMD GPU via lspci
+    if shutil.which("lspci"):
+        try:
+            output = subprocess.check_output(
+                ["lspci"],
+                text=True,
+                stderr=subprocess.DEVNULL
+            )
+            for line in output.splitlines():
+                if any(vendor in line.upper() for vendor in ["AMD", "RADEON", "NAVI", "RDNA"]):
+                    if "VGA" in line or "3D" in line:
+                        return line.split(": ", 1)[-1] if ": " in line else "AMD Radeon GPU"
+        except Exception:
+            pass
+    
+    return None
+
+
+def detect_intel_gpu() -> Optional[str]:
+    """Detect Intel GPU (Arc, Iris, UHD). Returns device name if found, None otherwise."""
+    # Check for Intel GPU via lspci
+    if shutil.which("lspci"):
+        try:
+            output = subprocess.check_output(
+                ["lspci"],
+                text=True,
+                stderr=subprocess.DEVNULL
+            )
+            for line in output.splitlines():
+                if "Intel" in line and any(gpu_type in line for gpu_type in ["Arc", "Iris", "UHD", "Xe"]):
+                    if "VGA" in line or "3D" in line:
+                        return line.split(": ", 1)[-1] if ": " in line else "Intel GPU"
+        except Exception:
+            pass
+    
+    # Check for Intel GPU driver (i915, xe)
+    if Path("/sys/module/i915").exists():
+        return "Intel GPU (i915)"
+    if Path("/sys/module/xe").exists():
+        return "Intel GPU (Xe)"
+    
+    return None
+
+
+def get_gpu_info() -> dict:
+    """Detect available GPUs and their capabilities.
+    
+    Returns:
+        {
+            "vendor": "nvidia" | "amd" | "intel" | "none",
+            "device": device_name or None,
+            "available": bool,
+            "can_run_code": bool,
+            "message": str
+        }
+    """
+    nvidia = detect_nvidia_gpu()
+    if nvidia:
+        return {
+            "vendor": "nvidia",
+            "device": nvidia,
+            "available": True,
+            "can_run_code": check_gpu_can_run_code("nvidia"),
+            "message": f"NVIDIA GPU detected: {nvidia}"
+        }
+    
+    amd = detect_amd_gpu()
+    if amd:
+        return {
+            "vendor": "amd",
+            "device": amd,
+            "available": True,
+            "can_run_code": check_gpu_can_run_code("amd"),
+            "message": f"AMD GPU detected: {amd}"
+        }
+    
+    intel = detect_intel_gpu()
+    if intel:
+        return {
+            "vendor": "intel",
+            "device": intel,
+            "available": True,
+            "can_run_code": check_gpu_can_run_code("intel"),
+            "message": f"Intel GPU detected: {intel}"
+        }
+    
+    return {
+        "vendor": "none",
+        "device": None,
+        "available": False,
+        "can_run_code": False,
+        "message": "No supported GPU detected"
+    }
+
+
+def check_gpu_can_run_code(vendor: str) -> bool:
+    """Check if the detected GPU can actually run code.
+    
+    This tests the GPU capabilities for each vendor.
+    """
+    if vendor == "nvidia":
+        try:
+            output = subprocess.check_output(
+                ["nvidia-smi", "-L"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=5
+            )
+            return len(output.strip()) > 0
+        except Exception:
+            return False
+    
+    elif vendor == "amd":
+        if shutil.which("rocm-smi"):
+            try:
+                output = subprocess.check_output(
+                    ["rocm-smi"],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5
+                )
+                return "GPU" in output
+            except Exception:
+                return False
+        return False
+    
+    elif vendor == "intel":
+        # Check if Intel GPU driver is loaded
+        if Path("/sys/module/i915").exists() or Path("/sys/module/xe").exists():
+            return True
+        return False
+    
+    return False
+
+
 def infer_gpu_vendor() -> str:
-    if shutil.which("nvidia-smi"):
-        return "nvidia"
-    if Path("/sys/class/drm").exists():
-        return "unknown"
-    return "none"
+    """Legacy function for backward compatibility. Returns vendor name."""
+    info = get_gpu_info()
+    return info["vendor"]
+
+
+def get_gpu_stress_cmd() -> Optional[str]:
+    """Generate a mild GPU stress command appropriate for the detected GPU.
+    
+    Returns None if no GPU or stress tool is available.
+    """
+    gpu_info = get_gpu_info()
+    vendor = gpu_info["vendor"]
+    
+    if vendor == "nvidia":
+        # Use nvidia-smi or CUDA if available
+        if shutil.which("nvidia-smi"):
+            # Mild stress: query GPU info periodically
+            return "while true; do nvidia-smi -q -d UTILIZATION > /dev/null 2>&1; sleep 0.5; done"
+        if shutil.which("cuda-samples"):
+            return "nbody -benchmark -numbodies=100000 2>/dev/null &"
+    
+    elif vendor == "amd":
+        # Use rocm-smi or clpeak for mild testing
+        if shutil.which("rocm-smi"):
+            return "while true; do rocm-smi > /dev/null 2>&1; sleep 0.5; done"
+        if shutil.which("clpeak"):
+            return "clpeak --device gpu --single-precision 2>/dev/null &"
+    
+    elif vendor == "intel":
+        # Intel GPU: use tools if available
+        if shutil.which("intel_gpu_top"):
+            return "intel_gpu_top -l 1 > /dev/null 2>&1 &"
+        if shutil.which("clpeak"):
+            return "clpeak --device gpu --single-precision 2>/dev/null &"
+    
+    return None
 
 
 def detect_nvidia_temps() -> Dict[str, float]:
@@ -82,8 +299,10 @@ def detect_nvidia_temps() -> Dict[str, float]:
             util = float(util_s)
         except ValueError:
             continue
-        out[f"gpu{idx}:{name}:temp_c"] = temp
-        out[f"gpu{idx}:{name}:util_percent"] = util
+        if _is_valid_temperature_c(temp):
+            out[f"gpu{idx}:{name}:temp_c"] = temp
+        if not math.isnan(util) and 0 <= util <= 100:
+            out[f"gpu{idx}:{name}:util_percent"] = util
     return out
 
 
@@ -98,7 +317,7 @@ def detect_psutil_temps() -> Dict[str, float]:
         for idx, entry in enumerate(entries):
             label = entry.label or f"sensor{idx}"
             key = f"{group_name}:{label}:temp_c"
-            if entry.current is not None and not math.isnan(entry.current):
+            if entry.current is not None and _is_valid_temperature_c(entry.current):
                 out[key] = float(entry.current)
     return out
 
@@ -120,7 +339,8 @@ def detect_linux_thermal_zone_temps() -> Dict[str, float]:
             val = float(raw_temp)
             if val > 200.0:
                 val = val / 1000.0
-            out[f"linux_thermal:{raw_type}:temp_c"] = val
+            if _is_valid_temperature_c(val):
+                out[f"linux_thermal:{raw_type}:temp_c"] = val
         except Exception:
             continue
     return out
@@ -146,10 +366,9 @@ def detect_psutil_core_freqs() -> Dict[str, float]:
             cur_mhz = float(current)
         except (TypeError, ValueError):
             continue
-        if math.isnan(cur_mhz):
-            continue
-        out[f"cpu_freq:core{idx}:mhz"] = cur_mhz
-        valid_vals.append(cur_mhz)
+        if _is_valid_cpu_frequency_mhz(cur_mhz):
+            out[f"cpu_freq:core{idx}:mhz"] = cur_mhz
+            valid_vals.append(cur_mhz)
 
     if valid_vals:
         out["cpu_freq:avg:mhz"] = sum(valid_vals) / len(valid_vals)
@@ -177,7 +396,8 @@ def detect_sensors_cmd_temps() -> Dict[str, float]:
             label = m.group(1).strip().replace(" ", "_")
             try:
                 val = float(m.group(2))
-                out[f"sensors:{label}:temp_c"] = val
+                if _is_valid_temperature_c(val):
+                    out[f"sensors:{label}:temp_c"] = val
             except Exception:
                 continue
     return out
@@ -393,6 +613,99 @@ def _is_gpu_temp_sensor(sensor: str) -> bool:
     return s.endswith(":temp_c") and "gpu" in s
 
 
+def _find_duplicate_sensors(
+    phase_sensor_temps: Dict[str, Dict[str, List[float]]],
+    tolerance: float = 0.01,
+) -> Dict[str, str]:
+    """Identify duplicate sensors with identical or near-identical readings.
+    
+    Returns a mapping of sensor names to keep. If duplicates are found, keeps
+    the first occurrence and returns it for all duplicates.
+    
+    Args:
+        phase_sensor_temps: Dict mapping phase names to sensor dicts
+        tolerance: Maximum relative difference to consider readings identical
+    
+    Returns:
+        Dict mapping all sensors to their canonical representative
+    """
+    # Collect all sensors and compute their fingerprint (mean value across all phases)
+    sensor_fingerprints: Dict[str, Optional[float]] = {}
+    sensor_first_occurrence: Dict[str, str] = {}  # Maps fingerprint to first sensor name
+    
+    for phase, sensor_dict in phase_sensor_temps.items():
+        for sensor, values in sensor_dict.items():
+            if not values:
+                continue
+            mean_val = sum(values) / len(values)
+            if sensor not in sensor_fingerprints:
+                sensor_fingerprints[sensor] = mean_val
+    
+    # Find duplicates: sensors with mean values within tolerance of each other
+    sensors_sorted = sorted(sensor_fingerprints.keys())
+    canonical_map: Dict[str, str] = {sensor: sensor for sensor in sensors_sorted}
+    
+    for i, sensor_a in enumerate(sensors_sorted):
+        if canonical_map[sensor_a] != sensor_a:
+            continue  # Already mapped to a duplicate
+        
+        mean_a = sensor_fingerprints[sensor_a]
+        if mean_a is None:
+            continue
+        
+        # Check against other sensors for duplicates
+        for sensor_b in sensors_sorted[i + 1:]:
+            if canonical_map[sensor_b] != sensor_b:
+                continue  # Already mapped
+            
+            mean_b = sensor_fingerprints[sensor_b]
+            if mean_b is None:
+                continue
+            
+            # Check if readings are nearly identical
+            max_val = max(abs(mean_a), abs(mean_b))
+            if max_val == 0:
+                relative_diff = 0.0
+            else:
+                relative_diff = abs(mean_a - mean_b) / max_val
+            
+            if relative_diff <= tolerance:
+                # Mark sensor_b as a duplicate of sensor_a
+                canonical_map[sensor_b] = sensor_a
+    
+    return canonical_map
+
+
+def _deduplicate_phase_data(
+    phase_sensor_temps: Dict[str, Dict[str, List[float]]],
+    phase_component_sensors: Dict[str, Dict[str, set[str]]],
+    canonical_map: Dict[str, str],
+) -> None:
+    """In-place deduplication: merge duplicate sensors into their canonical form.
+    
+    Modifies phase_sensor_temps and phase_component_sensors to consolidate duplicates.
+    """
+    for phase in phase_sensor_temps:
+        # Consolidate values from duplicates into canonical sensors
+        consolidated: Dict[str, List[float]] = {}
+        for sensor, values in phase_sensor_temps[phase].items():
+            canonical = canonical_map.get(sensor, sensor)
+            if canonical not in consolidated:
+                consolidated[canonical] = []
+            consolidated[canonical].extend(values)
+        
+        phase_sensor_temps[phase] = consolidated
+        
+        # Update component tracking
+        for component in phase_component_sensors[phase]:
+            old_sensors = phase_component_sensors[phase][component]
+            new_sensors = set()
+            for sensor in old_sensors:
+                canonical = canonical_map.get(sensor, sensor)
+                new_sensors.add(canonical)
+            phase_component_sensors[phase][component] = new_sensors
+
+
 def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
     """Summarize cooler effectiveness from phase CSV data.
 
@@ -440,6 +753,12 @@ def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
             except ValueError:
                 continue
 
+            # Skip invalid temperature and frequency readings
+            if sensor.endswith(":temp_c") and not _is_valid_temperature_c(value):
+                continue
+            if sensor.endswith(":mhz") and not _is_valid_cpu_frequency_mhz(value):
+                continue
+
             if ts:
                 phase_sample_timestamps[phase].add(ts)
 
@@ -456,6 +775,10 @@ def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
                 phase_sensor_temps[phase].setdefault(sensor, []).append(value)
                 if component:
                     phase_component_sensors[phase][component].add(sensor)
+
+    # Deduplicate identical sensors before verdict calculation
+    canonical_map = _find_duplicate_sensors(phase_sensor_temps, tolerance=0.01)
+    _deduplicate_phase_data(phase_sensor_temps, phase_component_sensors, canonical_map)
 
     phase_stats: Dict[str, Dict[str, Optional[float]]] = {}
     for phase, metrics in phase_metrics.items():
@@ -1055,8 +1378,14 @@ def start_stressors(cpu_workers: int, gpu_stress_cmd: Optional[str]) -> List[Run
     else:
         stressors.append(start_python_cpu_stressor(cpu_workers))
 
-    if gpu_stress_cmd:
-        stressors.append(run_subprocess(["bash", "-lc", gpu_stress_cmd], "gpu-stress-custom"))
+    # Use provided GPU stress command, or auto-generate one if GPU is available
+    actual_gpu_cmd = gpu_stress_cmd
+    if not actual_gpu_cmd:
+        actual_gpu_cmd = get_gpu_stress_cmd()
+    
+    if actual_gpu_cmd:
+        stressors.append(run_subprocess(["bash", "-lc", actual_gpu_cmd], "gpu-stress-auto"))
+    
     return stressors
 
 
@@ -1204,6 +1533,22 @@ def cli_main() -> int:
     csv_path = out_dir / f"temperature_log_{experiment_id}.csv"
     metadata_path = out_dir / f"run_metadata_{experiment_id}.json"
 
+    # Detect and report GPU status
+    print("=" * 80)
+    print("GPU Detection:")
+    gpu_info = get_gpu_info()
+    print(f"  Status: {gpu_info['message']}")
+    if gpu_info["available"]:
+        if gpu_info["can_run_code"]:
+            print(f"  Device: {gpu_info['device']}")
+            print(f"  Capability: ✓ GPU can run code - mild stress will be included")
+        else:
+            print(f"  WARNING: GPU detected but cannot execute code")
+            print(f"  GPU stress testing will be skipped")
+    else:
+        print("  No GPU will be stressed during test phases")
+    print("=" * 80)
+
     offenders = find_busy_user_processes(cpu_threshold=args.cpu_threshold)
     if offenders:
         print("Potentially interfering processes detected (CPU-active):")
@@ -1261,7 +1606,7 @@ def cli_main() -> int:
         "steady_timeout_sec": max(1, int(args.steady_timeout_sec)),
         "cpu_workers": args.cpu_workers,
         "gpu_stress_cmd": args.gpu_stress_cmd,
-        "gpu_vendor_guess": infer_gpu_vendor(),
+        "gpu_info": gpu_info,
         "host": {
             "platform": sys.platform,
             "hostname": os.uname().nodename if hasattr(os, "uname") else "unknown",

@@ -1,30 +1,46 @@
 # CoolVerdict
 
-CoolVerdict compares idle and stress temperatures before and after attaching an external cooler, then gives a simple keep/return verdict.
+CoolVerdict benchmarks external laptop/PC coolers by comparing temperatures and performance before and after attachment. It automatically detects all available sensors (CPU, GPU, storage), validates readings, deduplicates identical sensors, and provides a data-driven KEEP/RETURN verdict.
 
-Linux-only: this tool is intended for Linux systems (tested on Ubuntu 24.04).
+**Linux-only** (tested on Ubuntu 24.04). Supports NVIDIA, AMD, and Intel GPUs.
 
 ![Cooling Compare GUI](docs/GUI.png)
 
 ## What It Does
 
-Runs a four-phase cooling comparison test: idle and stress, before and after the external cooler is attached. It logs temperature sensors, CPU frequency, and GPU telemetry, and it can check for background processes before starting.
+**Four-phase comparison:**
+1. Uncooled (idle)
+2. Uncooled (stress)  
+3. Cooled (idle)
+4. Cooled (stress)
 
-- Single-file runner: `python cooler_verdict.py`
-- Live chart, sensor list, and end-of-run KEEP/RETURN verdict
-- Optional clean-start enforcement for interference checks
+**Features:**
+- Auto-detects CPU, GPU (NVIDIA/AMD/Intel), and storage temperatures
+- Validates all sensor readings (filters invalid data)
+- Detects and deduplicates identical sensors across phases
+- Mild GPU stress testing (auto-generated commands per GPU vendor)
+- Live chart, sensor monitoring, and final verdict (KEEP/DEFINITELY KEEP/RETURN/INCONCLUSIVE)
+- Enforces clean system state checks for interference-free benchmarking
+- Comprehensive reporting: verdict reason, temperature drops, frequency gains, per-sensor analysis
 
-## Setup
+## Setup & Installation
 
-Ubuntu sensor packages:
+**1. Install system dependencies:**
 
 ```bash
+# Core temperature sensors
 sudo apt install lm-sensors
-sudo apt install nvidia-utils-<your-driver-version>  # only if you want NVIDIA GPU temps via nvidia-smi
-sudo apt install nvme-cli  # only if you want NVMe temps via nvme smart-log
+
+# GPU support (optional but recommended)
+sudo apt install nvidia-utils        # NVIDIA GPUs
+# AMD ROCm (if you have AMD GPU): https://rocmdocs.amd.com/
+# Intel GPU drivers usually pre-installed on Ubuntu
+
+# Storage sensors
+sudo apt install nvme-cli            # NVMe/SSD temps
 ```
 
-`lm-sensors` provides the `sensors` command used for broader CPU/SSD/NVMe sensor coverage. NVMe temperatures are picked up when exposed by `sensors` or Linux thermal zones, so no extra Python package is needed.
+**2. Create Python environment and install:**
 
 ```bash
 python3 -m venv .venv
@@ -32,27 +48,57 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Output
-
-Results are written to `results/` as CSV logs and run metadata JSON.
-
-## Tests
+**3. Run the tool:**
 
 ```bash
-pytest tests
+python cooler_verdict.py              # Auto GUI or CLI (based on display)
+python cooler_verdict.py --cli        # Force CLI mode
+python cooler_verdict.py --help       # Show all options
 ```
 
-## Verdict Criteria (Summary)
+## How It Works
 
-| Criterion | Pass Rule | Effect |
+1. **Detection:** On startup, scans for all available temperature sensors (CPU, GPU, storage) and CPU frequency
+2. **Validation:** Rejects invalid readings (NaN, out-of-range values) at detection and CSV parsing
+3. **Deduplication:** Identifies identical sensors across phases and consolidates them before verdict calculation
+4. **GPU Stress:** Auto-generates appropriate mild GPU stress commands (NVIDIA/AMD/Intel)
+5. **Phases:** Logs temperature and frequency data during 4 phases (idle/stress × cooled/uncooled)
+6. **Verdict:** Analyzes temperature drops, frequency gains, and applies multi-criterion decision logic
+
+## Output & Testing
+
+**Output:** Results saved to `results/` as:
+- `temperature_log_*.csv` — All temperature/frequency readings per sensor per phase
+- `run_metadata_*.json` — Experiment settings, GPU info, phase summaries, and full verdict details
+
+**Tests:** Comprehensive test suite with 50 tests covering:
+- GPU detection (NVIDIA, AMD, Intel) and capability checking (28 tests)
+- Temperature/frequency validation and filtering (4 tests)
+- Duplicate sensor detection and deduplication (6 tests)
+- Sensor detection and steady-state logic (12 tests)
+
+```bash
+pytest tests -v
+```
+
+## Verdict Criteria
+
+| Criterion | Status | Effect |
 | --- | --- | --- |
-| Data complete | All 4 phases present; enough comparable CPU/GPU samples | Required, else inconclusive |
-| Idle improved | Idle best CPU/GPU drop >= 3 C | Required for keep |
-| Idle penalty check | No idle CPU/GPU rise worse than -2 C | Return on fail |
-| Stress temp improved | Stress best CPU/GPU drop >= 3 C | Supports keep |
-| Stress tradeoff positive | Stress can be up to +3 C hotter only with >= 3% stress clock gain | Alternative keep path |
-| Stress penalty check | No stress rise worse than -3 C without >= 3% clock gain | Return on fail |
-| Definitely keep upgrade | Keep conditions plus strong stress drop (>= 5 C, very strong >= 8 C) | Upgrades to definitely_keep |
+| **Data Quality** | All 4 phases complete, comparable CPU/GPU sensors, min samples | **INCONCLUSIVE** if fail |
+| **Idle Improvement** | Idle best CPU/GPU drop ≥ 3°C | **Required for KEEP** |
+| **Idle Penalty** | No idle CPU/GPU worse than -2°C | **RETURN** if fail |
+| **Stress Improvement** | Stress best CPU/GPU drop ≥ 3°C | Primary keep pathway |
+| **Stress Tradeoff** | Stress +3°C hotter only with ≥3% clock gain | Alternative keep pathway |
+| **Stress Penalty** | No stress worse than -3°C without ≥3% gain | **RETURN** if fail |
+| **Definitely Keep** | Keep + stress drop ≥5°C (very strong ≥8°C) | Upgrades to **DEFINITELY KEEP** |
+
+**Verdicts:**
+- **DEFINITELY KEEP** — Strong cooling benefit with no penalties
+- **KEEP** — Clear improvement without downsides
+- **PROBABLY RETURN** — Marginal improvements in idle/stress
+- **RETURN** — No improvement, penalties, or failed criteria
+- **INCONCLUSIVE** — Insufficient data or missing phases
 
 ## License
 

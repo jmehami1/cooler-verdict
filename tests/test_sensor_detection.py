@@ -192,3 +192,244 @@ def test_wait_until_temperatures_steady_honors_cancel_callback():
     assert out["cancelled"] is True
     assert out["timed_out"] is False
     assert out["reached_steady"] is False
+
+
+# ============ Tests for validation functions ============
+
+def test_is_valid_temperature_c_accepts_reasonable_values():
+    """Test that physically reasonable temperatures pass validation."""
+    assert temp_compare._is_valid_temperature_c(0.0)
+    assert temp_compare._is_valid_temperature_c(20.5)
+    assert temp_compare._is_valid_temperature_c(50.0)
+    assert temp_compare._is_valid_temperature_c(100.0)
+    assert temp_compare._is_valid_temperature_c(-10.0)
+    assert temp_compare._is_valid_temperature_c(-50.0)  # Boundary: min
+    assert temp_compare._is_valid_temperature_c(150.0)  # Boundary: max
+
+
+def test_is_valid_temperature_c_rejects_invalid_values():
+    """Test that invalid temperatures are rejected."""
+    assert not temp_compare._is_valid_temperature_c(float('nan'))
+    assert not temp_compare._is_valid_temperature_c(float('inf'))
+    assert not temp_compare._is_valid_temperature_c(float('-inf'))
+    assert not temp_compare._is_valid_temperature_c(None)
+    assert not temp_compare._is_valid_temperature_c(-51.0)  # Below min
+    assert not temp_compare._is_valid_temperature_c(151.0)  # Above max
+    assert not temp_compare._is_valid_temperature_c(-100.0)
+    assert not temp_compare._is_valid_temperature_c(200.0)
+
+
+def test_is_valid_cpu_frequency_mhz_accepts_reasonable_values():
+    """Test that physically reasonable CPU frequencies pass validation."""
+    assert temp_compare._is_valid_cpu_frequency_mhz(1.0)  # Boundary: min
+    assert temp_compare._is_valid_cpu_frequency_mhz(1000.0)
+    assert temp_compare._is_valid_cpu_frequency_mhz(3500.0)
+    assert temp_compare._is_valid_cpu_frequency_mhz(5000.0)
+    assert temp_compare._is_valid_cpu_frequency_mhz(10000.0)  # Boundary: max
+
+
+def test_is_valid_cpu_frequency_mhz_rejects_invalid_values():
+    """Test that invalid CPU frequencies are rejected."""
+    assert not temp_compare._is_valid_cpu_frequency_mhz(float('nan'))
+    assert not temp_compare._is_valid_cpu_frequency_mhz(float('inf'))
+    assert not temp_compare._is_valid_cpu_frequency_mhz(float('-inf'))
+    assert not temp_compare._is_valid_cpu_frequency_mhz(None)
+    assert not temp_compare._is_valid_cpu_frequency_mhz(0.5)  # Below min
+    assert not temp_compare._is_valid_cpu_frequency_mhz(0.0)
+    assert not temp_compare._is_valid_cpu_frequency_mhz(-100.0)
+    assert not temp_compare._is_valid_cpu_frequency_mhz(10001.0)  # Above max
+
+
+# ============ Tests for deduplication functions ============
+
+def test_find_duplicate_sensors_identifies_identical_sensors():
+    """Test that identical sensor readings are correctly identified as duplicates."""
+    phase_sensor_temps = {
+        "uncooled_idle": {
+            "cpu:core0:temp_c": [40.0, 40.1, 40.2],
+            "cpu:core1:temp_c": [40.0, 40.1, 40.2],  # Identical to core0
+            "gpu0:temp_c": [70.0, 70.1, 70.2],
+        },
+        "cooled_idle": {
+            "cpu:core0:temp_c": [35.0, 35.1, 35.2],
+            "cpu:core1:temp_c": [35.0, 35.1, 35.2],  # Still identical
+            "gpu0:temp_c": [65.0, 65.1, 65.2],
+        },
+        "uncooled_stress": {},
+        "cooled_stress": {},
+    }
+    
+    canonical_map = temp_compare._find_duplicate_sensors(phase_sensor_temps, tolerance=0.01)
+    
+    # cpu:core1 should map to cpu:core0 (first occurrence)
+    assert canonical_map["cpu:core1:temp_c"] == "cpu:core0:temp_c"
+    # gpu0 should stay as itself (not identical to CPU temps)
+    assert canonical_map["gpu0:temp_c"] == "gpu0:temp_c"
+
+
+def test_find_duplicate_sensors_handles_no_duplicates():
+    """Test that distinct sensors are not marked as duplicates."""
+    phase_sensor_temps = {
+        "uncooled_idle": {
+            "cpu:core0:temp_c": [40.0, 40.1, 40.2],
+            "gpu0:temp_c": [70.0, 70.1, 70.2],
+            "storage:ssd:temp_c": [45.0, 45.1, 45.2],
+        },
+        "cooled_idle": {
+            "cpu:core0:temp_c": [35.0, 35.1, 35.2],
+            "gpu0:temp_c": [65.0, 65.1, 65.2],
+            "storage:ssd:temp_c": [40.0, 40.1, 40.2],
+        },
+        "uncooled_stress": {},
+        "cooled_stress": {},
+    }
+    
+    canonical_map = temp_compare._find_duplicate_sensors(phase_sensor_temps, tolerance=0.01)
+    
+    # All should map to themselves
+    assert canonical_map["cpu:core0:temp_c"] == "cpu:core0:temp_c"
+    assert canonical_map["gpu0:temp_c"] == "gpu0:temp_c"
+    assert canonical_map["storage:ssd:temp_c"] == "storage:ssd:temp_c"
+
+
+def test_find_duplicate_sensors_near_identical_within_tolerance():
+    """Test that nearly identical sensors (within tolerance) are marked as duplicates."""
+    phase_sensor_temps = {
+        "uncooled_idle": {
+            "sensor_a:temp_c": [50.0, 50.1, 50.2],
+            "sensor_b:temp_c": [50.3, 50.4, 50.5],  # ~0.5% difference, within tolerance
+        },
+        "cooled_idle": {
+            "sensor_a:temp_c": [45.0, 45.1, 45.2],
+            "sensor_b:temp_c": [45.3, 45.4, 45.5],
+        },
+        "uncooled_stress": {},
+        "cooled_stress": {},
+    }
+    
+    canonical_map = temp_compare._find_duplicate_sensors(phase_sensor_temps, tolerance=0.02)
+    
+    # sensor_b should map to sensor_a (very close readings)
+    assert canonical_map["sensor_b:temp_c"] == "sensor_a:temp_c"
+
+
+def test_find_duplicate_sensors_preserves_first_occurrence():
+    """Test that deduplication keeps the first sensor name (alphabetically)."""
+    phase_sensor_temps = {
+        "uncooled_idle": {
+            "z_sensor:temp_c": [50.0, 50.1, 50.2],
+            "a_sensor:temp_c": [50.0, 50.1, 50.2],  # Identical to z_sensor
+        },
+        "cooled_idle": {},
+        "uncooled_stress": {},
+        "cooled_stress": {},
+    }
+    
+    canonical_map = temp_compare._find_duplicate_sensors(phase_sensor_temps, tolerance=0.01)
+    
+    # a_sensor comes first alphabetically
+    assert canonical_map["z_sensor:temp_c"] == "a_sensor:temp_c"
+
+
+def test_deduplicate_phase_data_consolidates_values():
+    """Test that deduplication consolidates sensor values correctly."""
+    phase_sensor_temps = {
+        "uncooled_idle": {
+            "sensor_a:temp_c": [40.0, 41.0],
+            "sensor_b:temp_c": [40.0, 41.0],  # Duplicate
+        },
+        "cooled_idle": {
+            "sensor_a:temp_c": [35.0, 36.0],
+            "sensor_b:temp_c": [35.0, 36.0],
+        },
+    }
+    
+    phase_component_sensors = {
+        "uncooled_idle": {"cpu": {"sensor_a:temp_c", "sensor_b:temp_c"}, "gpu": set(), "storage": set()},
+        "cooled_idle": {"cpu": {"sensor_a:temp_c", "sensor_b:temp_c"}, "gpu": set(), "storage": set()},
+    }
+    
+    canonical_map = {
+        "sensor_a:temp_c": "sensor_a:temp_c",
+        "sensor_b:temp_c": "sensor_a:temp_c",
+    }
+    
+    temp_compare._deduplicate_phase_data(phase_sensor_temps, phase_component_sensors, canonical_map)
+    
+    # After deduplication, only sensor_a should exist
+    assert "sensor_a:temp_c" in phase_sensor_temps["uncooled_idle"]
+    assert "sensor_b:temp_c" not in phase_sensor_temps["uncooled_idle"]
+    
+    # Values should be consolidated (merged)
+    assert len(phase_sensor_temps["uncooled_idle"]["sensor_a:temp_c"]) == 4  # 2 + 2 values
+    assert phase_sensor_temps["uncooled_idle"]["sensor_a:temp_c"] == [40.0, 41.0, 40.0, 41.0]
+    
+    # Component tracking should be updated
+    assert "sensor_a:temp_c" in phase_component_sensors["uncooled_idle"]["cpu"]
+    assert "sensor_b:temp_c" not in phase_component_sensors["uncooled_idle"]["cpu"]
+
+
+def test_deduplicate_phase_data_handles_empty_phases():
+    """Test that deduplication handles empty phases gracefully."""
+    phase_sensor_temps = {
+        "uncooled_idle": {"sensor_a:temp_c": [40.0, 41.0]},
+        "cooled_idle": {},
+        "uncooled_stress": {},
+        "cooled_stress": {},
+    }
+    
+    phase_component_sensors = {
+        "uncooled_idle": {"cpu": {"sensor_a:temp_c"}, "gpu": set(), "storage": set()},
+        "cooled_idle": {"cpu": set(), "gpu": set(), "storage": set()},
+        "uncooled_stress": {"cpu": set(), "gpu": set(), "storage": set()},
+        "cooled_stress": {"cpu": set(), "gpu": set(), "storage": set()},
+    }
+    
+    canonical_map = {"sensor_a:temp_c": "sensor_a:temp_c"}
+    
+    # Should not raise any errors
+    temp_compare._deduplicate_phase_data(phase_sensor_temps, phase_component_sensors, canonical_map)
+    
+    assert phase_sensor_temps["uncooled_idle"]["sensor_a:temp_c"] == [40.0, 41.0]
+    assert phase_sensor_temps["cooled_idle"] == {}
+
+
+def test_invalid_readings_filtered_in_detect_functions():
+    """Test that invalid readings are properly filtered in detection functions."""
+    fake_groups = {
+        "coretemp": [
+            SimpleNamespace(label="valid", current=50.0),
+            SimpleNamespace(label="too_cold", current=-51.0),
+            SimpleNamespace(label="too_hot", current=151.0),
+            SimpleNamespace(label="nan_val", current=float("nan")),
+        ]
+    }
+    with patch.object(temp_compare.psutil, "sensors_temperatures", return_value=fake_groups):
+        out = temp_compare.detect_psutil_temps()
+    
+    # Only valid reading should be included
+    assert "coretemp:valid:temp_c" in out
+    assert out["coretemp:valid:temp_c"] == 50.0
+    assert "coretemp:too_cold:temp_c" not in out
+    assert "coretemp:too_hot:temp_c" not in out
+    assert "coretemp:nan_val:temp_c" not in out
+
+
+def test_invalid_cpu_frequencies_filtered():
+    """Test that invalid CPU frequency readings are filtered."""
+    fake_freqs = [
+        SimpleNamespace(current=3500.0),  # Valid
+        SimpleNamespace(current=0.5),      # Too low
+        SimpleNamespace(current=15000.0),  # Too high
+        SimpleNamespace(current=float("nan")),  # NaN
+    ]
+    with patch.object(temp_compare.psutil, "cpu_freq", return_value=fake_freqs):
+        out = temp_compare.detect_psutil_core_freqs()
+    
+    # Only valid frequency should be included in output
+    assert "cpu_freq:core0:mhz" in out
+    assert out["cpu_freq:core0:mhz"] == 3500.0
+    assert "cpu_freq:core1:mhz" not in out
+    assert "cpu_freq:core2:mhz" not in out
+    assert "cpu_freq:core3:mhz" not in out
+    assert math.isclose(out["cpu_freq:avg:mhz"], 3500.0)
