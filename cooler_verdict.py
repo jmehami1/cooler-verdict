@@ -579,6 +579,54 @@ def _mean(values: List[float]) -> Optional[float]:
     return sum(values) / len(values)
 
 
+def _rolling_mean(values: List[float], window_points: int) -> List[float]:
+    """Return trailing rolling mean for each point in a series."""
+    if not values:
+        return []
+
+    window = max(1, int(window_points))
+    out: List[float] = []
+    running = 0.0
+    for idx, value in enumerate(values):
+        running += value
+        if idx >= window:
+            running -= values[idx - window]
+            out.append(running / window)
+        else:
+            out.append(running / (idx + 1))
+    return out
+
+
+def _build_rolling_overtime_profile(
+    uncooled_series: List[float],
+    cooled_series: List[float],
+    rolling_window_points: int,
+) -> Dict[str, Optional[float]]:
+    """Compare uncooled vs cooled trajectories using rolling averages only."""
+    compared_points = min(len(uncooled_series), len(cooled_series))
+    if compared_points == 0:
+        return {
+            "samples_compared": 0,
+            "mean_rolling_drop_c": None,
+            "peak_rolling_drop_c": None,
+            "worst_rolling_drop_c": None,
+            "points_cooler_pct": None,
+        }
+
+    uncooled_smoothed = _rolling_mean(uncooled_series[:compared_points], rolling_window_points)
+    cooled_smoothed = _rolling_mean(cooled_series[:compared_points], rolling_window_points)
+    rolling_deltas = [u - c for u, c in zip(uncooled_smoothed, cooled_smoothed)]
+    cooler_points = sum(1 for delta in rolling_deltas if delta > 0.0)
+
+    return {
+        "samples_compared": compared_points,
+        "mean_rolling_drop_c": _mean(rolling_deltas),
+        "peak_rolling_drop_c": max(rolling_deltas),
+        "worst_rolling_drop_c": min(rolling_deltas),
+        "points_cooler_pct": (cooler_points / compared_points) * 100.0,
+    }
+
+
 def _tail_window(values: List[float], fraction: float = 0.35, min_points: int = 12) -> List[float]:
     if not values:
         return []
@@ -721,6 +769,11 @@ def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
     phase_component_sensors: Dict[str, Dict[str, set[str]]] = {
         phase: {"cpu": set(), "gpu": set(), "storage": set()} for phase in phase_names
     }
+    phase_component_by_timestamp: Dict[str, Dict[str, Dict[str, List[float]]]] = {
+        phase: {"cpu": {}, "gpu": {}, "storage": {}} for phase in phase_names
+    }
+
+    rolling_window_points = 5
 
     if not csv_path.exists():
         return {
@@ -775,6 +828,34 @@ def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
                 phase_sensor_temps[phase].setdefault(sensor, []).append(value)
                 if component:
                     phase_component_sensors[phase][component].add(sensor)
+                    if ts:
+                        phase_component_by_timestamp[phase][component].setdefault(ts, []).append(value)
+
+    phase_component_series: Dict[str, Dict[str, List[float]]] = {
+        phase: {"cpu": [], "gpu": [], "storage": []} for phase in phase_names
+    }
+    for phase in phase_names:
+        for component in ("cpu", "gpu", "storage"):
+            ts_map = phase_component_by_timestamp[phase][component]
+            for ts in sorted(ts_map.keys()):
+                point_avg = _mean(ts_map[ts])
+                if point_avg is not None:
+                    phase_component_series[phase][component].append(point_avg)
+
+    rolling_overtime_comparisons: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {
+        "idle": {},
+        "stress": {},
+    }
+    for comparison_name, uncooled_phase, cooled_phase in (
+        ("idle", "uncooled_idle", "cooled_idle"),
+        ("stress", "uncooled_stress", "cooled_stress"),
+    ):
+        for component in ("cpu", "gpu", "storage"):
+            rolling_overtime_comparisons[comparison_name][component] = _build_rolling_overtime_profile(
+                uncooled_series=phase_component_series[uncooled_phase][component],
+                cooled_series=phase_component_series[cooled_phase][component],
+                rolling_window_points=rolling_window_points,
+            )
 
     # Deduplicate identical sensors before verdict calculation
     canonical_map = _find_duplicate_sensors(phase_sensor_temps, tolerance=0.01)
@@ -1260,6 +1341,8 @@ def summarize_cooler_effect_from_csv(csv_path: Path) -> dict:
         "best_cpu_freq_gain_pct": round(best_freq_gain, 3),
         "phase_stats": phase_stats,
         "comparisons": comparisons,
+        "rolling_window_points": rolling_window_points,
+        "rolling_overtime_comparisons": rolling_overtime_comparisons,
         "sensor_temp_drop_summary": sensor_temp_drop_summary,
         "criteria_evaluation": criteria_evaluation,
     }
@@ -1519,7 +1602,7 @@ def parse_cli_args() -> argparse.Namespace:
         "--steady-timeout-sec",
         type=int,
         default=900,
-        help="Maximum seconds to wait for steady-state between phases (default: 900).",
+        help="Maximum seconds to wait for steady-state after uncooled stress (test 2) (default: 900).",
     )
     return parser.parse_args()
 
@@ -1590,7 +1673,7 @@ def cli_main() -> int:
                 gpu_stress_cmd=(args.gpu_stress_cmd.strip() or None),
             )
 
-            if idx < len(phases) - 1:
+            if idx == 1:
                 summary["post_phase_steady_state"] = wait_until_temperatures_steady(
                     interval_sec=args.interval_sec,
                     timeout_sec=max(1, int(args.steady_timeout_sec)),
@@ -1749,6 +1832,8 @@ if GUI_DEPS_AVAILABLE:
             self.sensor_color_hex: Dict[str, str] = {}
             self.phase_cards: Dict[str, QFrame] = {}
             self.phase_card_labels: Dict[str, QLabel] = {}
+            self.plot_mode = "raw"
+            self.plot_rolling_window_points = 5
             self._hovered_sensor: Optional[str] = None
             self.current_cooler_assessment: Optional[dict] = None
 
@@ -2044,6 +2129,21 @@ if GUI_DEPS_AVAILABLE:
                 workflow_layout.addWidget(card)
                 self.phase_cards[phase_name] = card
                 self.phase_card_labels[phase_name] = label
+
+                if phase_name == "uncooled_stress":
+                    steady_card = QFrame()
+                    steady_card.setObjectName("PhaseCard")
+                    steady_layout = QVBoxLayout(steady_card)
+                    steady_layout.setContentsMargins(10, 8, 10, 8)
+                    steady_layout.setSpacing(2)
+                    steady_label = QLabel("Steady-state check (after test 2)")
+                    steady_label.setStyleSheet("font-weight: 700; color: #1f2937;")
+                    steady_desc = QLabel("Wait until temperatures stabilize before starting cooled phases.")
+                    steady_desc.setObjectName("SmallMuted")
+                    steady_desc.setWordWrap(True)
+                    steady_layout.addWidget(steady_label)
+                    steady_layout.addWidget(steady_desc)
+                    workflow_layout.addWidget(steady_card)
             left_layout.addWidget(workflow_box)
 
             setup_box = QGroupBox("Test settings")
@@ -2151,11 +2251,15 @@ if GUI_DEPS_AVAILABLE:
             plot_title_col.addWidget(plot_title)
             plot_title_col.addWidget(plot_subtitle)
             plot_header.addLayout(plot_title_col, stretch=1)
+            self.plot_mode_button = QPushButton("Mode: Raw")
+            self.plot_mode_button.setCheckable(True)
+            self.plot_mode_button.setToolTip("Switch between raw and rolling-average temperature plotting.")
             self.summary_toggle_button = QPushButton("Show summary")
             self.summary_toggle_button.setCheckable(True)
             self.summary_toggle_button.setEnabled(False)
             self.show_all_button = QPushButton("Show all")
             self.hide_all_button = QPushButton("Hide all")
+            plot_header.addWidget(self.plot_mode_button)
             plot_header.addWidget(self.summary_toggle_button)
             plot_header.addWidget(self.show_all_button)
             plot_header.addWidget(self.hide_all_button)
@@ -2264,6 +2368,7 @@ if GUI_DEPS_AVAILABLE:
             self.start_button.clicked.connect(self.start_testing)
             self.stop_button.clicked.connect(self.stop_testing)
             self.check_button.clicked.connect(self.check_running_processes)
+            self.plot_mode_button.toggled.connect(self._toggle_plot_mode)
             self.summary_toggle_button.toggled.connect(self._toggle_summary_overlay)
             self.show_all_button.clicked.connect(lambda: self._set_all_plot_visibility(True))
             self.hide_all_button.clicked.connect(lambda: self._set_all_plot_visibility(False))
@@ -2276,6 +2381,11 @@ if GUI_DEPS_AVAILABLE:
         def _toggle_summary_overlay(self, checked: bool) -> None:
             self._set_summary_overlay_visible(checked)
 
+        def _toggle_plot_mode(self, rolling_enabled: bool) -> None:
+            self.plot_mode = "rolling" if rolling_enabled else "raw"
+            self.plot_mode_button.setText("Mode: Rolling avg" if rolling_enabled else "Mode: Raw")
+            self._refresh_plot()
+
         def _set_summary_overlay_visible(self, visible: bool) -> None:
             can_show = self.current_cooler_assessment is not None
             show = bool(visible and can_show)
@@ -2284,6 +2394,7 @@ if GUI_DEPS_AVAILABLE:
             self.summary_toggle_button.setChecked(show)
             self.summary_toggle_button.setText("Show timeline" if show else "Show summary")
             self.summary_toggle_button.blockSignals(False)
+            self.plot_mode_button.setEnabled(not show)
             self.show_all_button.setEnabled(not show)
             self.hide_all_button.setEnabled(not show)
 
@@ -2673,12 +2784,18 @@ if GUI_DEPS_AVAILABLE:
                 ys = self.sensor_data.get(sensor, [])
                 if not xs or not ys:
                     continue
+
+                if self.plot_mode == "rolling":
+                    ys_plot = _rolling_mean([float(v) for v in ys], self.plot_rolling_window_points)
+                else:
+                    ys_plot = [float(v) for v in ys]
+
                 label = self.sensor_display_names.get(sensor, self._format_sensor_label(sensor))
                 color = self.sensor_color_hex.get(sensor)
                 if color:
-                    (line,) = self.ax.plot(xs, ys, label=label, linewidth=2.0, color=color, solid_capstyle="round")
+                    (line,) = self.ax.plot(xs, ys_plot, label=label, linewidth=2.0, color=color, solid_capstyle="round")
                 else:
-                    (line,) = self.ax.plot(xs, ys, label=label, linewidth=2.0, solid_capstyle="round")
+                    (line,) = self.ax.plot(xs, ys_plot, label=label, linewidth=2.0, solid_capstyle="round")
                     try:
                         self.sensor_color_hex[sensor] = to_hex(line.get_color())
                     except Exception:
@@ -2687,7 +2804,7 @@ if GUI_DEPS_AVAILABLE:
                 visible = self.plot_visibility.get(sensor, True)
                 line.set_visible(visible)
                 if visible:
-                    visible_values.extend([float(v) for v in ys if v is not None])
+                    visible_values.extend([float(v) for v in ys_plot if v is not None])
                 self.plot_lines[sensor] = line
                 self.legend_artist_to_sensor[line] = sensor
                 plotted.append(sensor)
@@ -3316,7 +3433,7 @@ if GUI_DEPS_AVAILABLE:
                         )
 
                         phase_index = len(self.phase_summaries)
-                        if phase_index < len(phases) - 1 and not self.stop_event.is_set():
+                        if phase_index == 1 and not self.stop_event.is_set():
                             self._set_status("Waiting for temperatures to reach steady state...")
                             summary["post_phase_steady_state"] = wait_until_temperatures_steady(
                                 interval_sec=interval_sec,

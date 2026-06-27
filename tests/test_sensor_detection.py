@@ -157,6 +157,9 @@ def test_summarize_cooler_effect_from_csv_recommends_keep(tmp_path):
     assert criteria_by_name["minimum_samples_met"]["status"] == "pass"
     assert criteria_by_name["idle_temperature_improved"]["status"] == "pass"
     assert criteria_by_name["keep_requirements_met"]["status"] == "pass"
+    assert out["rolling_window_points"] == 5
+    assert out["rolling_overtime_comparisons"]["idle"]["cpu"]["mean_rolling_drop_c"] is not None
+    assert out["rolling_overtime_comparisons"]["stress"]["cpu"]["mean_rolling_drop_c"] is not None
     sensor_map = {item["sensor"]: item for item in out["sensor_temp_drop_summary"]}
     assert "cpu:pkg:temp_c" in sensor_map
     assert sensor_map["cpu:pkg:temp_c"]["idle_drop_pct"] is not None
@@ -192,6 +195,43 @@ def test_wait_until_temperatures_steady_honors_cancel_callback():
     assert out["cancelled"] is True
     assert out["timed_out"] is False
     assert out["reached_steady"] is False
+
+
+def test_rolling_overtime_comparison_suppresses_single_spike(tmp_path):
+    csv_path = tmp_path / "rolling_spike.csv"
+    with csv_path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["timestamp_utc", "phase", "cooling_state", "load_state", "sensor", "value"])
+
+        for i in range(24):
+            ts = f"2026-01-01T00:10:{i:02d}+00:00"
+            uncooled_temp = 88.0
+            cooled_temp = 82.0
+            if i == 12:
+                cooled_temp = 100.0  # synthetic spike
+
+            w.writerow([ts, "uncooled_stress", "uncooled", "stress", "cpu:pkg:temp_c", f"{uncooled_temp:.3f}"])
+            w.writerow([ts, "cooled_stress", "cooled", "stress", "cpu:pkg:temp_c", f"{cooled_temp:.3f}"])
+            w.writerow([ts, "uncooled_stress", "uncooled", "stress", "cpu_freq:avg:mhz", "3600.000"])
+            w.writerow([ts, "cooled_stress", "cooled", "stress", "cpu_freq:avg:mhz", "3700.000"])
+
+        for i in range(24):
+            ts = f"2026-01-01T00:20:{i:02d}+00:00"
+            w.writerow([ts, "uncooled_idle", "uncooled", "idle", "cpu:pkg:temp_c", "55.000"])
+            w.writerow([ts, "cooled_idle", "cooled", "idle", "cpu:pkg:temp_c", "51.000"])
+            w.writerow([ts, "uncooled_idle", "uncooled", "idle", "cpu_freq:avg:mhz", "3000.000"])
+            w.writerow([ts, "cooled_idle", "cooled", "idle", "cpu_freq:avg:mhz", "3100.000"])
+
+    out = temp_compare.summarize_cooler_effect_from_csv(csv_path)
+    stress_cpu_profile = out["rolling_overtime_comparisons"]["stress"]["cpu"]
+
+    assert stress_cpu_profile["samples_compared"] == 24
+    assert stress_cpu_profile["mean_rolling_drop_c"] is not None
+    assert stress_cpu_profile["mean_rolling_drop_c"] > 0.0
+    assert stress_cpu_profile["worst_rolling_drop_c"] is not None
+    assert stress_cpu_profile["worst_rolling_drop_c"] > -15.0
+    assert stress_cpu_profile["points_cooler_pct"] is not None
+    assert stress_cpu_profile["points_cooler_pct"] > 70.0
 
 
 # ============ Tests for validation functions ============

@@ -11,6 +11,7 @@ CoolVerdict benchmarks external laptop/PC coolers by comparing temperatures and 
 **Four-phase comparison:**
 1. Uncooled (idle)
 2. Uncooled (stress)  
+	- Steady-state check (runs after test 2, before cooled phases)
 3. Cooled (idle)
 4. Cooled (stress)
 
@@ -18,8 +19,11 @@ CoolVerdict benchmarks external laptop/PC coolers by comparing temperatures and 
 - Auto-detects CPU, GPU (NVIDIA/AMD/Intel), and storage temperatures
 - Validates all sensor readings (filters invalid data)
 - Detects and deduplicates identical sensors across phases
+- Steady-state wait inserted after uncooled stress (test 2) before cooler-on phases
 - Mild GPU stress testing (auto-generated commands per GPU vendor)
 - Live chart, sensor monitoring, and final verdict (KEEP/DEFINITELY KEEP/RETURN/INCONCLUSIVE)
+- Live plotting mode switch: raw temperatures <-> rolling-average temperatures (while running)
+- Rolling overtime phase comparison with spike suppression (rolling means)
 - Enforces clean system state checks for interference-free benchmarking
 - Comprehensive reporting: verdict reason, temperature drops, frequency gains, per-sensor analysis
 
@@ -63,19 +67,21 @@ python cooler_verdict.py --help       # Show all options
 3. **Deduplication:** Identifies identical sensors across phases and consolidates them before verdict calculation
 4. **GPU Stress:** Auto-generates appropriate mild GPU stress commands (NVIDIA/AMD/Intel)
 5. **Phases:** Logs temperature and frequency data during 4 phases (idle/stress × cooled/uncooled)
-6. **Verdict:** Analyzes temperature drops, frequency gains, and applies multi-criterion decision logic
+6. **Steady-state gate:** Waits for temperatures to stabilize after phase 2 before starting cooled phases
+7. **Rolling overtime analysis:** Compares uncooled vs cooled trajectories using rolling averages to suppress transient spikes
+8. **Verdict:** Uses phase tail-window averages plus rolling overtime metrics to apply multi-criterion decision logic
 
 ## Output & Testing
 
 **Output:** Results saved to `results/` as:
 - `temperature_log_*.csv` — All temperature/frequency readings per sensor per phase
-- `run_metadata_*.json` — Experiment settings, GPU info, phase summaries, and full verdict details
+- `run_metadata_*.json` — Experiment settings, GPU info, phase summaries, rolling overtime comparisons, and full verdict details
 
-**Tests:** Comprehensive test suite with 50 tests covering:
+**Tests:** Comprehensive test suite with 51 tests covering:
 - GPU detection (NVIDIA, AMD, Intel) and capability checking (28 tests)
 - Temperature/frequency validation and filtering (4 tests)
 - Duplicate sensor detection and deduplication (6 tests)
-- Sensor detection and steady-state logic (12 tests)
+- Sensor detection, steady-state logic, and rolling overtime comparison (13 tests)
 
 ```bash
 pytest tests -v
